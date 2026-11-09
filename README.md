@@ -9,11 +9,11 @@ Hệ thống quay số may mắn 3D cao cấp dành cho đại hội / lễ hộ
 - **Backend & Database**: Supabase (PostgreSQL, Row Level Security, RPC Functions, Storage, Realtime).
 - **Thuật Toán Quay Số (Fairness & Security)**:
   - Chọn số **hoàn toàn phía server** trong hàm PostgreSQL RPC `draw_next`.
-  - Sử dụng `pgcrypto gen_random_bytes(4)` kết hợp **Rejection Sampling** loại bỏ hoàn toàn hiện tượng lệch modulo (modulo bias).
-  - Khóa dòng sự kiện (`FOR UPDATE`) triệt tiêu hoàn toàn race condition và double-draw.
-  - Quản lý trạng thái bằng State Machine nghiêm ngặt: `idle` → `revealing` → `won` | `absent` | `void`.
-  - Hỗ trợ `idempotency_key` chống double-click khi mạng chập chờn.
-  - Phân quyền: `REVOKE EXECUTE FROM PUBLIC, anon, authenticated; GRANT ONLY TO service_role`.
+  - Sử dụng `pgcrypto gen_random_bytes(4)` kết hợp **Rejection Sampling** (chuẩn 64-bit BIGINT, $2^{32} = 4,294,967,296$) loại bỏ hoàn toàn hiện tượng lệch modulo (modulo bias).
+  - Khóa dòng sự kiện (`FOR UPDATE`) đồng bộ hóa trên mọi thao tác `draw_next`, `confirm_won`, `mark_absent`, `void_last`, triệt tiêu hoàn toàn race condition và double-draw.
+  - Partial Unique Index: Chỉ duy nhất 1 sự kiện được `is_active = true`.
+  - Trigger ngăn chặn thay đổi `test_mode` khi sự kiện đã có lượt quay chính thức (`is_test = false`).
+  - Phân quyền nghiêm ngặt: `REVOKE EXECUTE FROM PUBLIC, anon, authenticated; GRANT ONLY TO service_role`.
 - **Màn hình sân khấu 3D**: Three.js qua React Three Fiber, Rapier Physics, Bloom effect, GSAP.
 
 ---
@@ -29,10 +29,52 @@ church-lucky-draw/
 │  └─ components/three/       # Stage, Cage, Balls, Chute, Chùm sáng, Effects
 ├─ packages/shared/           # Zod schemas, Draw state machine, CSPRNG helpers & Vitest
 ├─ supabase/
-│  ├─ migrations/             # 00001 (Schema, RLS), 00002 (CSPRNG RPCs), 00003 (Seed)
-│  └─ tests/                  # Integration test suite kiểm thử DB trực tiếp
+│  ├─ migrations/             # 20261109000001 (Schema, RLS), 20261109000002 (CSPRNG RPCs)
+│  ├─ seed.sql                # Dữ liệu mẫu (chỉ dùng cục bộ, không bao giờ push vào remote migration)
+│  └─ tests/                  # Integration test suite kiểm thử DB độc lập
 ├─ turbo.json                 # Cấu hình Turborepo pipeline
-└─ README.md                  # Hướng dẫn thiết lập & diễn tập
+└─ README.md                  # Hướng dẫn thiết lập, phân quyền & diễn tập
+```
+
+---
+
+## 🔐 Thiết Lập Xác Thực & Tài Khoản Admin Duy Nhất
+
+### 1. Vô hiệu hóa đăng ký công khai (Disable Public Sign-ups)
+Để đảm bảo an toàn tuyệt đối cho sự kiện:
+1. Truy cập **Supabase Dashboard** -> **Authentication** -> **Providers** -> **Email**.
+2. **Bỏ chọn (Disable)** mục **"Allow new users to sign up"** (hoặc "Enable Email Signup").
+3. Nhấn **Save**. Lúc này chỉ có người quản trị được mời hoặc tạo trực tiếp mới có tài khoản.
+
+### 2. Tạo tài khoản Admin duy nhất & gán quyền `app_metadata.role = 'admin'`
+Bạn có thể tạo tài khoản qua Supabase Dashboard -> **Authentication** -> **Users** -> **Add user**.
+
+Sau đó, mở **SQL Editor** trên Supabase Dashboard và chạy lệnh sau để gán quyền Admin:
+
+```sql
+-- Gán quyền admin vào app_metadata (được kiểm tra an toàn trong RLS is_admin())
+UPDATE auth.users
+SET raw_app_meta_data = raw_app_meta_data || '{"role": "admin"}'::jsonb
+WHERE email = 'admin@your-parish.org';
+```
+
+Hoặc tạo trực tiếp qua Node.js Supabase Admin API với Service Role Key:
+
+```ts
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseAdmin = createClient(
+  process.env.SUPABASE_URL!,
+  process.env.SUPABASE_SERVICE_ROLE_KEY!,
+  { auth: { autoRefreshToken: false, persistSession: false } }
+);
+
+await supabaseAdmin.auth.admin.createUser({
+  email: 'admin@your-parish.org',
+  password: 'SecurePassword2026!',
+  email_confirm: true,
+  app_metadata: { role: 'admin' },
+});
 ```
 
 ---
@@ -50,7 +92,7 @@ pnpm install
 Tạo file `.env` tại thư mục root (tham khảo file `.env.example`):
 
 ```bash
-# Public credentials (truyền cho trình duyệt)
+# Public credentials (truyền an toàn cho browser bundle)
 NEXT_PUBLIC_SUPABASE_URL=https://your-project-id.supabase.co
 NEXT_PUBLIC_SUPABASE_ANON_KEY=sb_publishable_your_key_here
 
@@ -62,29 +104,21 @@ DATABASE_URL=postgresql://postgres:[YOUR-PASSWORD]@db.your-project-id.supabase.c
 
 ### 3. Áp dụng Database Migrations với Supabase CLI
 
-Theo yêu cầu kiểm duyệt an toàn, các file migration được lưu tại `supabase/migrations/`:
-- `20261109000001_initial_schema.sql`: Bảng, RLS policies, Realtime publication, Storage bucket.
+Thư mục `supabase/migrations/` chỉ chứa 2 file schema & RPCs chính thức:
+- `20261109000001_initial_schema.sql`: Bảng, Partial Unique Indexes, RLS policies, Realtime publication, Storage bucket.
 - `20261109000002_draw_rpcs.sql`: Hàm `draw_next`, `confirm_won`, `mark_absent`, `void_last`, `clear_test_draws`, CSPRNG rejection sampling.
-- `20261109000003_seed.sql`: Dữ liệu mẫu (Vé 5 số 1–3000; 10 Ba, 5 Nhì, 3 Nhất, 1 Đặc biệt).
 
-Bạn có thể review và đẩy migration lên Supabase bằng Supabase CLI:
+File dữ liệu mẫu `supabase/seed.sql` được tách riêng, không nằm trong migrations.
 
+Để đẩy migration lên Supabase:
 ```bash
-# Đăng nhập Supabase CLI nếu chưa
-supabase login
-
-# Liên kết với project
 supabase link --project-ref your-project-id
-
-# Đẩy các migration lên cơ sở dữ liệu
 supabase db push
 ```
 
-Hoặc thực thi trực tiếp các file SQL qua psql / Supabase SQL Editor:
+Hoặc nạp seed data cho môi trường phát triển:
 ```bash
-psql "$DATABASE_URL" -f supabase/migrations/20261109000001_initial_schema.sql
-psql "$DATABASE_URL" -f supabase/migrations/20261109000002_draw_rpcs.sql
-psql "$DATABASE_URL" -f supabase/migrations/20261109000003_seed.sql
+psql "$DATABASE_URL" -f supabase/seed.sql
 ```
 
 ### 4. Chạy Unit Tests
@@ -93,9 +127,9 @@ psql "$DATABASE_URL" -f supabase/migrations/20261109000003_seed.sql
 pnpm test
 ```
 
-### 5. Chạy Integration Test (Sau khi push migration vào DB)
+### 5. Chạy Integration Test Suite (7 Kịch bản chuyên sâu)
 
-Chạy kịch bản kiểm thử toàn diện (Concurrency lock, Idempotency, 40+ draws không trùng lặp, State transitions):
+Chạy kịch bản kiểm thử toàn diện độc lập (Partial Unique Index, Concurrency Row Lock, Idempotency, Quyền hạn phân quyền anon/authenticated bị từ chối, State transitions, 350+ draws liên tiếp không trùng lặp):
 
 ```bash
 pnpm test:integration

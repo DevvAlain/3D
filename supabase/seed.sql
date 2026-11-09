@@ -1,6 +1,7 @@
 -- ==============================================================================
--- 00003_seed.sql
+-- supabase/seed.sql
 -- Seed Demo Data: 5 digits, range 1-3000, 4 prize tiers (10 Ba, 5 Nhì, 3 Nhất, 1 Đặc biệt)
+-- Used for local development (supabase db reset), NEVER pushed to production migrations.
 -- ==============================================================================
 
 DO $$
@@ -14,7 +15,7 @@ BEGIN
     LIMIT 1;
 
     IF v_event_id IS NULL THEN
-        -- 1. Insert Event
+        -- 1. Insert Event (Only ONE active event allowed)
         INSERT INTO public.events (
             id,
             title,

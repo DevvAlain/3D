@@ -3,8 +3,26 @@
 -- Church Lucky Draw - Core Schema, Constraints, RLS, Realtime & Storage
 -- ==============================================================================
 
--- Enable cryptographic functions
-CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+-- 0. SCHEMAS & EXTENSIONS SETUP
+CREATE SCHEMA IF NOT EXISTS extensions;
+CREATE SCHEMA IF NOT EXISTS auth;
+CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA extensions;
+
+-- Mock/fallback for auth.jwt() if running in standard Postgres / local test environment
+CREATE OR REPLACE FUNCTION auth.jwt()
+RETURNS jsonb
+LANGUAGE sql
+STABLE
+AS $$
+  SELECT COALESCE(
+    nullif(current_setting('request.jwt.claims', true), '')::jsonb,
+    '{}'::jsonb
+  );
+$$;
+
+-- Default Privileges: revoke execution on future functions from public/anon/authenticated
+ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC, anon, authenticated;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO service_role;
 
 -- 1. EVENTS TABLE
 CREATE TABLE IF NOT EXISTS public.events (
@@ -33,7 +51,10 @@ CREATE TABLE IF NOT EXISTS public.events (
     CONSTRAINT chk_status CHECK (status IN ('draft', 'ready', 'active', 'completed', 'paused'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_events_is_active ON public.events (is_active) WHERE is_active = true;
+-- Partial Unique Index: ONLY ONE event can be active at any time
+CREATE UNIQUE INDEX IF NOT EXISTS idx_events_single_active 
+    ON public.events (is_active) 
+    WHERE is_active = true;
 
 -- 2. EXCLUDED TICKETS TABLE (Cancelled, unsold, or disqualified tickets)
 CREATE TABLE IF NOT EXISTS public.excluded_tickets (
@@ -84,7 +105,7 @@ CREATE TABLE IF NOT EXISTS public.draws (
 
 -- Partial Unique Index:
 -- Only 'void' returns a ticket to the pool.
--- 'revealing', 'won', and 'absent' permanently claim or exclude the ticket for this event/mode.
+-- 'revealing', 'won', and 'absent' permanently claim or exclude the ticket for this event and mode.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_draws_unique_claimed_ticket
     ON public.draws (event_id, is_test, ticket)
     WHERE status IN ('revealing', 'won', 'absent');
@@ -102,7 +123,36 @@ CREATE INDEX IF NOT EXISTS idx_draws_event_seq
 CREATE INDEX IF NOT EXISTS idx_draws_prize_status
     ON public.draws (prize_id, is_test, status);
 
--- 5. ROW LEVEL SECURITY (RLS)
+-- 5. TRIGGER: Prevent modifying events.test_mode when real (non-test) draws exist
+CREATE OR REPLACE FUNCTION public.check_event_test_mode_update()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    IF OLD.test_mode IS DISTINCT FROM NEW.test_mode THEN
+        IF EXISTS (
+            SELECT 1 FROM public.draws
+            WHERE event_id = NEW.id AND is_test = false
+        ) THEN
+            RAISE EXCEPTION 'CANNOT_CHANGE_TEST_MODE: Không thể thay đổi test_mode khi sự kiện đã có lượt quay chính thức (is_test = false)';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.check_event_test_mode_update() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.check_event_test_mode_update() TO service_role;
+
+DROP TRIGGER IF EXISTS trg_events_prevent_test_mode_change ON public.events;
+CREATE TRIGGER trg_events_prevent_test_mode_change
+    BEFORE UPDATE OF test_mode ON public.events
+    FOR EACH ROW
+    EXECUTE FUNCTION public.check_event_test_mode_update();
+
+-- 6. ROW LEVEL SECURITY (RLS)
 ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.excluded_tickets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.prizes ENABLE ROW LEVEL SECURITY;
@@ -114,13 +164,16 @@ RETURNS BOOLEAN
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, auth
 AS $$
   SELECT COALESCE(
     (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin',
     false
   );
 $$;
+
+REVOKE ALL ON FUNCTION public.is_admin() FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated, service_role;
 
 -- RLS Policies: Anonymous / Public has NO SELECT by default
 -- Admin has full CRUD permissions
@@ -148,11 +201,12 @@ CREATE POLICY admin_all_draws ON public.draws
     USING (public.is_admin())
     WITH CHECK (public.is_admin());
 
--- 6. REALTIME PUBLICATION
--- Enable Supabase Realtime for live results on Admin dashboard
+-- 7. REALTIME PUBLICATION
 DO $$
 BEGIN
-    IF NOT EXISTS (
+    IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
+        CREATE PUBLICATION supabase_realtime FOR TABLE public.draws;
+    ELSIF NOT EXISTS (
         SELECT 1 FROM pg_publication_tables 
         WHERE pubname = 'supabase_realtime' 
           AND schemaname = 'public' 
@@ -162,8 +216,7 @@ BEGIN
     END IF;
 END $$;
 
--- 7. STORAGE BUCKET: event-assets
--- Creates the bucket if storage schema exists, with public read and admin-only upload
+-- 8. STORAGE BUCKET: event-assets
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'storage') THEN

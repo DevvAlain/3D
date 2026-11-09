@@ -4,16 +4,18 @@
 -- ==============================================================================
 
 -- 1. Helper Function: Uniform Random Bigint in [0, p_max) using pgcrypto & Rejection Sampling
--- Eliminates modulo bias completely.
+-- Eliminates modulo bias completely. Uses 64-bit BIGINT (2^32 = 4294967296 overflows 32-bit int).
 CREATE OR REPLACE FUNCTION public.crypto_random_int(p_max BIGINT)
 RETURNS BIGINT
 LANGUAGE plpgsql
 VOLATILE
+SECURITY DEFINER
+SET search_path = public, extensions
 AS $$
 DECLARE
     v_limit BIGINT;
     v_rand BIGINT;
-    c_m CONSTANT BIGINT := 4294967296; -- 2^32
+    c_m CONSTANT BIGINT := 4294967296; -- 2^32 (strictly in 64-bit signed BIGINT)
 BEGIN
     IF p_max <= 0 THEN
         RAISE EXCEPTION 'crypto_random_int: p_max must be positive, got %', p_max;
@@ -27,16 +29,19 @@ BEGIN
     v_limit := c_m - (c_m % p_max);
 
     LOOP
-        -- Read 4 cryptographically secure random bytes as an unsigned 32-bit int
-        v_rand := ('x' || encode(gen_random_bytes(4), 'hex'))::bit(32)::BIGINT;
+        -- Read 4 cryptographically secure random bytes from extensions schema as unsigned 32-bit int
+        v_rand := ('x' || encode(extensions.gen_random_bytes(4), 'hex'))::bit(32)::BIGINT;
         
         -- Reject values in the biased tail [v_limit, c_m)
         IF v_rand < v_limit THEN
-            RETURN v_rand % p_max;
+            RETURN (v_rand % p_max)::BIGINT;
         END IF;
     END LOOP;
 END;
 $$;
+
+REVOKE ALL ON FUNCTION public.crypto_random_int(BIGINT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.crypto_random_int(BIGINT) TO service_role;
 
 -- 2. Main RPC: draw_next
 -- Atomically locks event, validates active revealing state, determines next prize quota,
@@ -49,7 +54,7 @@ CREATE OR REPLACE FUNCTION public.draw_next(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, extensions
 AS $$
 DECLARE
     v_event public.events%ROWTYPE;
@@ -62,7 +67,7 @@ DECLARE
     v_chosen_ticket INT;
     v_next_seq INT;
 BEGIN
-    -- 1. Lock the event row to prevent concurrent draws
+    -- 1. Lock the event row to serialize all draws & state transitions
     SELECT * INTO v_event
     FROM public.events
     WHERE id = p_event_id
@@ -150,7 +155,7 @@ BEGIN
     -- 6. Sample Uniform Random Index k in [0, v_valid_count) without modulo bias
     v_k := public.crypto_random_int(v_valid_count);
 
-    -- 7. Fetch the k-th valid ticket
+    -- 7. Fetch the k-th valid ticket using deterministic ORDER BY before OFFSET
     SELECT gs.num
     INTO v_chosen_ticket
     FROM generate_series(v_event.range_from, v_event.range_to) AS gs(num)
@@ -204,13 +209,17 @@ BEGIN
 END;
 $$;
 
+REVOKE ALL ON FUNCTION public.draw_next(UUID, TEXT, BOOLEAN) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.draw_next(UUID, TEXT, BOOLEAN) TO service_role;
+
 -- 3. RPC: confirm_won
 -- Transitions a draw from 'revealing' to 'won'
+-- Locks the event row FOR UPDATE to serialize with draw_next.
 CREATE OR REPLACE FUNCTION public.confirm_won(p_draw_id UUID)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, extensions
 AS $$
 DECLARE
     v_draw public.draws%ROWTYPE;
@@ -223,6 +232,9 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'DRAW_NOT_FOUND: Lượt quay không tồn tại (id: %)', p_draw_id;
     END IF;
+
+    -- Lock parent event row to synchronize with draw_next
+    PERFORM 1 FROM public.events WHERE id = v_draw.event_id FOR UPDATE;
 
     IF v_draw.status <> 'revealing' THEN
         RAISE EXCEPTION 'INVALID_STATE_TRANSITION: Chỉ có thể xác nhận trúng thưởng khi đang ở trạng thái revealing (hiện tại: %)', v_draw.status;
@@ -237,14 +249,18 @@ BEGIN
 END;
 $$;
 
+REVOKE ALL ON FUNCTION public.confirm_won(UUID) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.confirm_won(UUID) TO service_role;
+
 -- 4. RPC: mark_absent
 -- Transitions a draw from 'revealing' to 'absent'
+-- Locks the event row FOR UPDATE to serialize with draw_next.
 -- Ticket remains permanently excluded, does NOT count toward prize quota.
 CREATE OR REPLACE FUNCTION public.mark_absent(p_draw_id UUID)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, extensions
 AS $$
 DECLARE
     v_draw public.draws%ROWTYPE;
@@ -257,6 +273,9 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'DRAW_NOT_FOUND: Lượt quay không tồn tại (id: %)', p_draw_id;
     END IF;
+
+    -- Lock parent event row to synchronize with draw_next
+    PERFORM 1 FROM public.events WHERE id = v_draw.event_id FOR UPDATE;
 
     IF v_draw.status <> 'revealing' THEN
         RAISE EXCEPTION 'INVALID_STATE_TRANSITION: Chỉ có thể đánh dấu vắng mặt khi đang ở trạng thái revealing (hiện tại: %)', v_draw.status;
@@ -271,8 +290,12 @@ BEGIN
 END;
 $$;
 
+REVOKE ALL ON FUNCTION public.mark_absent(UUID) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.mark_absent(UUID) TO service_role;
+
 -- 5. RPC: void_last
 -- Voids ONLY the latest draw for this event & test mode. Allowed only from 'revealing' or 'won'.
+-- Locks parent event row FIRST to serialize with draw_next.
 -- Ticket is returned to the pool because status becomes 'void'.
 CREATE OR REPLACE FUNCTION public.void_last(
     p_event_id UUID,
@@ -281,11 +304,14 @@ CREATE OR REPLACE FUNCTION public.void_last(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, extensions
 AS $$
 DECLARE
     v_draw public.draws%ROWTYPE;
 BEGIN
+    -- Lock parent event row FIRST
+    PERFORM 1 FROM public.events WHERE id = p_event_id FOR UPDATE;
+
     -- Find and lock the latest draw
     SELECT * INTO v_draw
     FROM public.draws
@@ -312,17 +338,23 @@ BEGIN
 END;
 $$;
 
+REVOKE ALL ON FUNCTION public.void_last(UUID, BOOLEAN) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.void_last(UUID, BOOLEAN) TO service_role;
+
 -- 6. RPC: clear_test_draws
 -- Resets only test mode draws for an event
 CREATE OR REPLACE FUNCTION public.clear_test_draws(p_event_id UUID)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, extensions
 AS $$
 DECLARE
     v_deleted_count INT;
 BEGIN
+    -- Lock parent event row
+    PERFORM 1 FROM public.events WHERE id = p_event_id FOR UPDATE;
+
     DELETE FROM public.draws
     WHERE event_id = p_event_id
       AND is_test = true;
@@ -333,21 +365,5 @@ BEGIN
 END;
 $$;
 
--- ==============================================================================
--- PRIVILEGES & SECURITY HARDENING
--- The browser must NEVER be able to call these state-changing functions via PostgREST.
--- REVOKE from public, anon, authenticated; GRANT ONLY to service_role.
--- ==============================================================================
-REVOKE EXECUTE ON FUNCTION public.crypto_random_int(BIGINT) FROM PUBLIC, anon, authenticated;
-REVOKE EXECUTE ON FUNCTION public.draw_next(UUID, TEXT, BOOLEAN) FROM PUBLIC, anon, authenticated;
-REVOKE EXECUTE ON FUNCTION public.confirm_won(UUID) FROM PUBLIC, anon, authenticated;
-REVOKE EXECUTE ON FUNCTION public.mark_absent(UUID) FROM PUBLIC, anon, authenticated;
-REVOKE EXECUTE ON FUNCTION public.void_last(UUID, BOOLEAN) FROM PUBLIC, anon, authenticated;
-REVOKE EXECUTE ON FUNCTION public.clear_test_draws(UUID) FROM PUBLIC, anon, authenticated;
-
-GRANT EXECUTE ON FUNCTION public.crypto_random_int(BIGINT) TO service_role;
-GRANT EXECUTE ON FUNCTION public.draw_next(UUID, TEXT, BOOLEAN) TO service_role;
-GRANT EXECUTE ON FUNCTION public.confirm_won(UUID) TO service_role;
-GRANT EXECUTE ON FUNCTION public.mark_absent(UUID) TO service_role;
-GRANT EXECUTE ON FUNCTION public.void_last(UUID, BOOLEAN) TO service_role;
+REVOKE ALL ON FUNCTION public.clear_test_draws(UUID) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.clear_test_draws(UUID) TO service_role;
