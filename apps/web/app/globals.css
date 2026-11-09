@@ -1,0 +1,15 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --background: #0B1230;
+  --foreground: #FFF6E0;
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  font-family: 'Be Vietnam Pro', system-ui, -apple-system, sans-serif;
+  overflow-x: hidden;
+}

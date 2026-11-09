@@ -1,0 +1,21 @@
+{
+  "name": "church-lucky-draw",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Production-quality Lucky Draw web app for church parish events with 3D stage presentation",
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev",
+    "lint": "turbo run lint",
+    "test": "turbo run test",
+    "test:integration": "pnpm --filter @church/shared test:integration",
+    "clean": "turbo run clean && rimraf node_modules"
+  },
+  "devDependencies": {
+    "turbo": "^2.4.4",
+    "typescript": "^5.7.3",
+    "tsx": "^4.19.3",
+    "rimraf": "^6.0.1"
+  },
+  "packageManager": "pnpm@12.18.0"
+}
