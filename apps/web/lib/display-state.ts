@@ -14,6 +14,11 @@ export interface ComputeDisplayStateInput {
   prizes: Prize[];
   draws: Draw[];
   excludedTickets: number[];
+  /**
+   * Optional precomputed count of remaining valid tickets (avoids transferring/scanning
+   * large excluded_tickets tables on every `/api/display/state` poll).
+   */
+  validTicketsRemainingOverride?: number;
   isPreview?: boolean;
   serverTime?: string;
 }
@@ -23,7 +28,15 @@ export interface ComputeDisplayStateInput {
  * Filters quota and pool calculations strictly by `event.test_mode`.
  */
 export function computeDisplayStatePayload(input: ComputeDisplayStateInput): DisplayStatePayload {
-  const { event, prizes, draws, excludedTickets, isPreview = false, serverTime = new Date().toISOString() } = input;
+  const {
+    event,
+    prizes,
+    draws,
+    excludedTickets,
+    validTicketsRemainingOverride,
+    isPreview = false,
+    serverTime = new Date().toISOString(),
+  } = input;
 
   if (!event) {
     return {
@@ -97,12 +110,15 @@ export function computeDisplayStatePayload(input: ComputeDisplayStateInput): Dis
     .filter((d) => d.status === 'revealing' || d.status === 'won' || d.status === 'absent')
     .map((d) => d.ticket);
 
-  const validTicketsRemaining = calculateValidTicketCount(
-    event.range_from,
-    event.range_to,
-    excludedTickets,
-    claimedTickets
-  );
+  const validTicketsRemaining =
+    validTicketsRemainingOverride !== undefined
+      ? Math.max(0, validTicketsRemainingOverride)
+      : calculateValidTicketCount(
+          event.range_from,
+          event.range_to,
+          excludedTickets,
+          claimedTickets
+        );
 
   const totalPoolSize =
     event.range_to >= event.range_from ? event.range_to - event.range_from + 1 : 0;
@@ -165,6 +181,10 @@ export function resolveDrawNextClientTransition(result: DrawNextResult): DrawNex
 /**
  * Loads the active event and full display payload using service_role on the server.
  * Presenter has zero direct DB privileges and obtains everything through this helper.
+ *
+ * Computes `validTicketsRemaining` using lightweight integer count queries
+ * (`COUNT(*)` on `excluded_tickets` + claimed draws count), avoiding scanning
+ * `generate_series` or transferring full `excluded_tickets` lists on every poll.
  */
 export async function fetchActiveDisplayState(isPreview: boolean = false): Promise<DisplayStatePayload> {
   const admin = createAdminSupabaseClient();
@@ -189,7 +209,7 @@ export async function fetchActiveDisplayState(isPreview: boolean = false): Promi
     });
   }
 
-  const [prizesRes, drawsRes, excludedRes] = await Promise.all([
+  const [prizesRes, drawsRes, excludedCountRes] = await Promise.all([
     admin
       .from('prizes')
       .select('*')
@@ -203,8 +223,10 @@ export async function fetchActiveDisplayState(isPreview: boolean = false): Promi
       .order('seq', { ascending: true }),
     admin
       .from('excluded_tickets')
-      .select('ticket')
-      .eq('event_id', activeEvent.id),
+      .select('ticket', { count: 'exact', head: true })
+      .eq('event_id', activeEvent.id)
+      .gte('ticket', activeEvent.range_from)
+      .lte('ticket', activeEvent.range_to),
   ]);
 
   if (prizesRes.error) {
@@ -213,17 +235,56 @@ export async function fetchActiveDisplayState(isPreview: boolean = false): Promi
   if (drawsRes.error) {
     throw new Error(`Không thể tải lịch sử lượt quay: ${drawsRes.error.message}`);
   }
-  if (excludedRes.error) {
-    throw new Error(`Không thể tải danh sách vé loại trừ: ${excludedRes.error.message}`);
+  if (excludedCountRes.error) {
+    throw new Error(`Không thể đếm vé loại trừ: ${excludedCountRes.error.message}`);
   }
 
-  const excludedTickets = (excludedRes.data ?? []).map((row: { ticket: number }) => row.ticket);
+  const draws = (drawsRes.data ?? []) as Draw[];
+  const claimedInRange = Array.from(
+    new Set(
+      draws
+        .filter(
+          (d) =>
+            (d.status === 'revealing' || d.status === 'won' || d.status === 'absent') &&
+            d.ticket >= activeEvent.range_from &&
+            d.ticket <= activeEvent.range_to
+        )
+        .map((d) => d.ticket)
+    )
+  );
+
+  // Usually 0 overlap because excluded tickets aren't drawn; subtract any post-draw exclusions safely.
+  let overlapExcludedCount = 0;
+  for (let i = 0; i < claimedInRange.length; i += 500) {
+    const chunk = claimedInRange.slice(i, i + 500);
+    const { count: overlapCount, error: overlapErr } = await admin
+      .from('excluded_tickets')
+      .select('ticket', { count: 'exact', head: true })
+      .eq('event_id', activeEvent.id)
+      .in('ticket', chunk);
+
+    if (overlapErr) {
+      throw new Error(`Không thể kiểm tra vé loại trừ trùng lặp: ${overlapErr.message}`);
+    }
+    overlapExcludedCount += overlapCount ?? 0;
+  }
+
+  const totalPoolSize =
+    activeEvent.range_to >= activeEvent.range_from
+      ? activeEvent.range_to - activeEvent.range_from + 1
+      : 0;
+  const excludedCount = excludedCountRes.count ?? 0;
+  const validTicketsRemaining = Math.max(
+    0,
+    totalPoolSize - excludedCount - (claimedInRange.length - overlapExcludedCount)
+  );
 
   return computeDisplayStatePayload({
     event: activeEvent,
     prizes: (prizesRes.data ?? []) as Prize[],
-    draws: (drawsRes.data ?? []) as Draw[],
-    excludedTickets,
+    draws,
+    excludedTickets: [],
+    validTicketsRemainingOverride: validTicketsRemaining,
     isPreview,
   });
 }

@@ -64,6 +64,11 @@ export const ResetEventRequestSchema = z.object({
 });
 export type ResetEventRequest = z.infer<typeof ResetEventRequestSchema>;
 
+export const ActivateEventRequestSchema = z.object({
+  event_id: z.string().uuid('ID sự kiện không hợp lệ'),
+});
+export type ActivateEventRequest = z.infer<typeof ActivateEventRequestSchema>;
+
 export const AuditLogSchema = z.object({
   id: z.string().uuid(),
   event_id: z.string().uuid().nullable(),
@@ -96,35 +101,55 @@ export interface DisplayStatePayload {
   serverTime: string;
 }
 
-export const EventConfigImportSchema = z.object({
-  version: z.literal(1).default(1),
-  event: z.object({
-    title: z.string().trim().min(3).max(150),
-    parish_name: z.string().trim().min(3).max(150),
-    digits: z.number().int().min(3).max(7),
-    range_from: z.number().int().min(0),
-    range_to: z.number().int(),
-    theme: z.enum(['classic', 'christmas', 'easter']).default('classic'),
-    primary_color: z.string().regex(/^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/).default('#F5C451'),
-    test_mode: z.boolean().default(true),
-  }),
-  prizes: z
-    .array(
-      z.object({
-        name: z.string().trim().min(1).max(100),
-        reward: z.string().trim().min(1).max(200),
-        quantity: z.number().int().min(1),
-        sort_order: z.number().int().min(0),
-      })
-    )
-    .default([]),
-  excluded_tickets: z
-    .array(
-      z.object({
-        ticket: z.number().int().min(0),
-        reason: z.string().max(250).nullable().optional(),
-      })
-    )
-    .default([]),
-});
+export const EventConfigImportSchema = z
+  .object({
+    version: z.literal(1).default(1),
+    target_event_id: z.string().uuid('ID sự kiện đích không hợp lệ').optional(),
+    event: z.object({
+      title: z.string().trim().min(3, 'Tên sự kiện tối thiểu 3 ký tự').max(150),
+      parish_name: z.string().trim().min(3, 'Tên giáo xứ tối thiểu 3 ký tự').max(150),
+      digits: z.number().int().min(3, 'Số chữ số tối thiểu 3').max(7, 'Số chữ số tối đa 7'),
+      range_from: z.number().int().min(0, 'Số bắt đầu không được âm'),
+      range_to: z.number().int(),
+      theme: z.enum(['classic', 'christmas', 'easter']).default('classic'),
+      primary_color: z.string().regex(/^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/).default('#F5C451'),
+      test_mode: z.boolean().default(true),
+    }),
+    prizes: z
+      .array(
+        z.object({
+          name: z.string().trim().min(1).max(100),
+          reward: z.string().trim().min(1).max(200),
+          quantity: z.number().int().min(1),
+          sort_order: z.number().int().min(0),
+        })
+      )
+      .default([]),
+    excluded_tickets: z
+      .array(
+        z.object({
+          ticket: z.number().int().min(0),
+          reason: z.string().max(250).nullable().optional(),
+        })
+      )
+      .default([]),
+  })
+  .superRefine((data, ctx) => {
+    const { digits, range_from, range_to } = data.event;
+    if (range_from > range_to) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Số bắt đầu (range_from) không được lớn hơn số kết thúc (range_to)',
+        path: ['event', 'range_to'],
+      });
+    }
+    const maxAllowed = Math.pow(10, digits);
+    if (range_to >= maxAllowed) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `Với ${digits} chữ số, số kết thúc tối đa là ${maxAllowed - 1}`,
+        path: ['event', 'range_to'],
+      });
+    }
+  });
 export type EventConfigImport = z.infer<typeof EventConfigImportSchema>;

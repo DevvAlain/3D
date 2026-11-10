@@ -143,17 +143,21 @@ export function DangerAndPreviewTab({
     URL.revokeObjectURL(url);
   }
 
-  async function handleImportConfigFile(file: File | undefined) {
+  async function handleImportConfigFile(file: File | undefined, overwriteCurrent: boolean) {
     if (!file) return;
     setImporting(true);
     try {
       const rawText = await file.text();
-      const parsed = JSON.parse(rawText) as unknown;
+      const parsed = JSON.parse(rawText) as Record<string, unknown>;
+      const payload =
+        overwriteCurrent && event.id
+          ? { ...parsed, target_event_id: event.id }
+          : { ...parsed, target_event_id: undefined };
 
       const res = await fetch('/api/admin/import-config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(parsed),
+        body: JSON.stringify(payload),
       });
       const json = await res.json();
       if (!res.ok) {
@@ -162,7 +166,9 @@ export function DangerAndPreviewTab({
       }
       onFeedback(
         'success',
-        `Đã nhập thành công sự kiện nháp "${json.event?.title}" (${json.importedPrizes ?? 0} giải, ${json.importedExcludedTickets ?? 0} vé loại trừ).`
+        overwriteCurrent
+          ? `Đã cập nhật cấu hình sự kiện "${json.event?.title}" (${json.importedPrizes ?? 0} giải, ${json.importedExcludedTickets ?? 0} vé loại trừ).`
+          : `Đã nhập thành công sự kiện nháp "${json.event?.title}" (${json.importedPrizes ?? 0} giải, ${json.importedExcludedTickets ?? 0} vé loại trừ).`
       );
       await onRefresh(json.event?.id);
     } catch {
@@ -216,13 +222,44 @@ export function DangerAndPreviewTab({
 
             <label className="inline-flex cursor-pointer items-center justify-center gap-2 rounded-lg border border-parish-gold/35 bg-parish-navy/80 px-4 py-2 text-sm font-semibold text-parish-goldLight hover:bg-parish-gold/10">
               <Upload className="h-4 w-4" />
-              {importing ? 'Đang nhập...' : 'Nhập cấu hình JSON'}
+              {importing ? 'Đang nhập...' : 'Nhập thành sự kiện nháp mới'}
               <input
                 type="file"
                 accept="application/json,.json"
                 className="sr-only"
                 disabled={importing}
-                onChange={(e) => handleImportConfigFile(e.target.files?.[0])}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = '';
+                  void handleImportConfigFile(file, false);
+                }}
+              />
+            </label>
+
+            <label
+              className={`inline-flex items-center justify-center gap-2 rounded-lg border px-4 py-2 text-sm font-semibold ${
+                locks.hasRealDraws
+                  ? 'cursor-not-allowed border-white/15 bg-white/5 text-parish-cream/40'
+                  : 'cursor-pointer border-parish-gold/35 bg-parish-navy/80 text-parish-goldLight hover:bg-parish-gold/10'
+              }`}
+              title={
+                locks.hasRealDraws
+                  ? 'Bị khóa vì sự kiện đã có lượt quay chính thức'
+                  : 'Nhập đè vào sự kiện hiện tại'
+              }
+            >
+              <Upload className="h-4 w-4" />
+              Áp dụng vào sự kiện hiện tại
+              <input
+                type="file"
+                accept="application/json,.json"
+                className="sr-only"
+                disabled={importing || locks.hasRealDraws}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  e.target.value = '';
+                  void handleImportConfigFile(file, true);
+                }}
               />
             </label>
           </CardContent>

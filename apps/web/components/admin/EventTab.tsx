@@ -25,6 +25,7 @@ export function EventTab({ event, hasRealDraws, onRefresh, onFeedback }: EventTa
   const [isActive, setIsActive] = React.useState(event.is_active);
   const [testMode, setTestMode] = React.useState(event.test_mode);
   const [saving, setSaving] = React.useState(false);
+  const [activating, setActivating] = React.useState(false);
   const [uploadingKind, setUploadingKind] = React.useState<'logo' | 'music' | null>(null);
 
   React.useEffect(() => {
@@ -69,6 +70,29 @@ export function EventTab({ event, hasRealDraws, onRefresh, onFeedback }: EventTa
       onFeedback('error', 'Lỗi kết nối khi lưu thông tin sự kiện.');
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleAtomicActivate() {
+    if (!event.id || event.is_active) return;
+    setActivating(true);
+    try {
+      const res = await fetch('/api/admin/activate-event', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event_id: event.id }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        onFeedback('error', json.error || 'Không thể kích hoạt sự kiện.');
+        return;
+      }
+      onFeedback('success', `Đã kích hoạt sự kiện "${event.title}" cho màn hình Display.`);
+      await onRefresh(event.id);
+    } catch {
+      onFeedback('error', 'Lỗi kết nối khi kích hoạt sự kiện.');
+    } finally {
+      setActivating(false);
     }
   }
 
@@ -174,18 +198,31 @@ export function EventTab({ event, hasRealDraws, onRefresh, onFeedback }: EventTa
             </div>
 
             <div className="space-y-4 rounded-xl border border-parish-gold/20 bg-parish-navy/50 p-4">
-              <div className="flex items-center justify-between gap-4">
+              <div className="flex flex-wrap items-center justify-between gap-4">
                 <div>
                   <p className="font-semibold text-parish-cream">Kích hoạt hiển thị trên Display</p>
                   <p className="text-xs text-parish-cream/65">
-                    Chỉ 1 sự kiện được kích hoạt tại một thời điểm. Bật mục này sẽ tự tắt sự kiện đang bật khác.
+                    Chỉ 1 sự kiện được kích hoạt tại một thời điểm (thực thi nguyên tử trong 1 transaction).
                   </p>
                 </div>
-                <Switch
-                  aria-label="Kích hoạt hiển thị trên Display"
-                  checked={isActive}
-                  onCheckedChange={setIsActive}
-                />
+                <div className="flex items-center gap-3">
+                  {!event.is_active ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      disabled={activating}
+                      onClick={() => void handleAtomicActivate()}
+                    >
+                      {activating ? 'Đang kích hoạt...' : 'Kích hoạt ngay'}
+                    </Button>
+                  ) : null}
+                  <Switch
+                    aria-label="Kích hoạt hiển thị trên Display"
+                    checked={isActive}
+                    onCheckedChange={setIsActive}
+                  />
+                </div>
               </div>
 
               <div className="border-t border-white/10 pt-4">

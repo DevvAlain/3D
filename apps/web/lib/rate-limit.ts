@@ -14,8 +14,14 @@ export interface RateLimitResult {
 }
 
 /**
- * Sliding-window in-memory rate limiter suitable for low-overhead route protection.
- * Can be reset in tests via `resetRateLimiter()`.
+ * Best-effort sliding-window in-memory rate limiter for low-overhead anti-burst protection.
+ *
+ * IMPORTANT (Serverless / Vercel): Each warm serverless isolate keeps separate in-memory Maps,
+ * so this limiter does NOT enforce a strict global limit across isolates. Real concurrency,
+ * double-draw, and state-integrity protection is enforced atomically in PostgreSQL via
+ * `SELECT ... FOR UPDATE`, partial unique indexes (`DRAW_IN_PROGRESS`), and `idempotency_key`.
+ *
+ * Can be reset in unit tests via `resetRateLimiter()`.
  */
 export function checkSlidingWindowRateLimit(
   key: string,

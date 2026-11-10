@@ -3,23 +3,10 @@ import { z } from 'zod';
 import { requireApiRole } from '@/lib/supabase/auth';
 import { createAdminSupabaseClient } from '@/lib/supabase/admin';
 import { enforceApiRateLimit } from '@/lib/rate-limit';
-
-const ALLOWED_IMAGE_MIME_TYPES = new Map<string, string>([
-  ['image/png', 'png'],
-  ['image/jpeg', 'jpg'],
-  ['image/webp', 'webp'],
-]);
-
-const ALLOWED_AUDIO_MIME_TYPES = new Map<string, string>([
-  ['audio/mpeg', 'mp3'],
-  ['audio/mp3', 'mp3'],
-  ['audio/ogg', 'ogg'],
-  ['audio/wav', 'wav'],
-  ['audio/x-wav', 'wav'],
-  ['audio/aac', 'aac'],
-]);
-
-const MAX_UPLOAD_BYTES = 25 * 1024 * 1024; // 25MB matching storage bucket
+import {
+  MAX_UPLOAD_BYTES,
+  validateUploadMetadataAndBytes,
+} from '@/lib/upload-validation';
 
 export async function POST(req: Request) {
   const auth = await requireApiRole(['admin']);
@@ -52,32 +39,26 @@ export async function POST(req: Request) {
       );
     }
 
-    const mime = fileEntry.type.toLowerCase();
-    const ext =
-      kindParse.data === 'logo'
-        ? ALLOWED_IMAGE_MIME_TYPES.get(mime)
-        : ALLOWED_AUDIO_MIME_TYPES.get(mime);
+    const arrayBuffer = await fileEntry.arrayBuffer();
+    const headerBytes = new Uint8Array(arrayBuffer.slice(0, 16));
+    const checked = validateUploadMetadataAndBytes({
+      fileName: fileEntry.name,
+      mimeType: fileEntry.type,
+      kind: kindParse.data,
+      headerBytes,
+    });
 
-    if (!ext) {
-      return NextResponse.json(
-        {
-          error:
-            kindParse.data === 'logo'
-              ? 'Định dạng ảnh không hợp lệ (chỉ hỗ trợ PNG, JPEG, WEBP; không cho phép SVG).'
-              : 'Định dạng âm thanh không hợp lệ (chỉ hỗ trợ MP3, OGG, WAV, AAC).',
-        },
-        { status: 400 }
-      );
+    if (!checked.ok) {
+      return NextResponse.json({ error: checked.error }, { status: 400 });
     }
 
     const admin = createAdminSupabaseClient();
-    const filePath = `${eventIdParse.data}/${kindParse.data}-${Date.now()}.${ext}`;
-    const arrayBuffer = await fileEntry.arrayBuffer();
+    const filePath = `${eventIdParse.data}/${kindParse.data}-${Date.now()}.${checked.ext}`;
 
     const { error: uploadErr } = await admin.storage
       .from('event-assets')
       .upload(filePath, arrayBuffer, {
-        contentType: mime === 'audio/mp3' ? 'audio/mpeg' : mime === 'audio/x-wav' ? 'audio/wav' : mime,
+        contentType: checked.contentType,
         upsert: true,
       });
 

@@ -62,6 +62,10 @@ async function runIntegrationTests() {
     path.resolve(repoRoot, 'supabase/migrations/20261109000002_draw_rpcs.sql'),
     'utf-8'
   );
+  const migration3 = fs.readFileSync(
+    path.resolve(repoRoot, 'supabase/migrations/20261110000003_activate_event_rpc.sql'),
+    'utf-8'
+  );
 
   const useLocalSupabase = await isLocalSupabaseRunning();
   let embeddedPg: EmbeddedPostgres | null = null;
@@ -137,6 +141,8 @@ async function runIntegrationTests() {
       await pool.query(migration1);
       console.log('[INIT] Applying migration 20261109000002_draw_rpcs.sql...');
       await pool.query(migration2);
+      console.log('[INIT] Applying migration 20261110000003_activate_event_rpc.sql...');
+      await pool.query(migration3);
       console.log('✓ Migrations applied successfully.');
     }
 
@@ -218,6 +224,20 @@ async function runIntegrationTests() {
       `INSERT INTO public.prizes (event_id, name, reward, quantity, sort_order) VALUES ($1, 'Giải Khuyến Khích', 'Bình nước', 50, 1)`,
       [activeEventId]
     );
+
+    // Test atomic activate_event switching (concurrent calls -> exactly 1 active event!)
+    await Promise.all([
+      pool.query(`SELECT public.activate_event($1)`, [inactiveEventId]),
+      pool.query(`SELECT public.activate_event($1)`, [activeEventId]),
+    ]);
+    await pool.query(`SELECT public.activate_event($1)`, [activeEventId]);
+    const activeCheck = await pool.query<{ id: string }>(
+      `SELECT id FROM public.events WHERE is_active = true`
+    );
+    if (activeCheck.rows.length !== 1 || activeCheck.rows[0].id !== activeEventId) {
+      throw new Error(`activate_event failed atomic switch: ${JSON.stringify(activeCheck.rows)}`);
+    }
+    console.log('✓ Atomic activate_event verified cleanly across concurrent switch calls.');
 
     // ========================================================================
     // TEST 2: Real Multi-Connection Concurrency Tests (pg.Pool)
@@ -359,6 +379,7 @@ async function runIntegrationTests() {
       { label: 'void_last', sql: `SELECT public.void_last('${activeEventId}'::uuid)` },
       { label: 'clear_test_draws', sql: `SELECT public.clear_test_draws('${activeEventId}'::uuid)` },
       { label: 'reset_event', sql: `SELECT public.reset_event('${activeEventId}'::uuid)` },
+      { label: 'activate_event', sql: `SELECT public.activate_event('${activeEventId}'::uuid)` },
       { label: 'crypto_random_int', sql: `SELECT public.crypto_random_int(10)` },
     ];
 
@@ -486,16 +507,17 @@ async function runIntegrationTests() {
     if (Number(countAfterReset.rows[0].cnt) !== 0) {
       throw new Error('reset_event failed to clear draws');
     }
-    const auditRes = await pool.query<{ action: string; actor_email: string; details: any }>(
-      `SELECT action, actor_email, details FROM public.audit_logs WHERE id = $1`,
+    const auditRes = await pool.query<{ action: string; actor_id: string | null; actor_email: string | null; details: any }>(
+      `SELECT action, actor_id, actor_email, details FROM public.audit_logs WHERE id = $1`,
       [resetRes.audit_log_id]
     );
     if (
       auditRes.rows.length !== 1 ||
       auditRes.rows[0].action !== 'RESET_EVENT' ||
+      auditRes.rows[0].actor_id !== actorId ||
       auditRes.rows[0].actor_email !== 'admin@parish.org'
     ) {
-      throw new Error(`Expected RESET_EVENT audit log entry, got ${JSON.stringify(auditRes.rows)}`);
+      throw new Error(`Expected RESET_EVENT audit log entry with actor_id & actor_email, got ${JSON.stringify(auditRes.rows)}`);
     }
     await assertRoleDenied(
       'authenticated',

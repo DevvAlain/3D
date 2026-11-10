@@ -30,18 +30,28 @@ export async function POST(req: Request) {
     }
 
     const admin = createAdminSupabaseClient();
-
-    if (parsed.data.is_active) {
-      await admin.from('events').update({ is_active: false }).eq('is_active', true);
-    }
+    const shouldActivate = Boolean(parsed.data.is_active);
 
     const { data, error } = await admin
       .from('events')
-      .insert(parsed.data)
+      .insert({ ...parsed.data, is_active: false })
       .select('*')
       .single<Event>();
 
     if (error) return rpcErrorResponse(error);
+
+    if (shouldActivate && data?.id) {
+      const { data: activatedRes, error: actErr } = await admin.rpc('activate_event', {
+        p_event_id: data.id,
+      });
+      if (actErr) return rpcErrorResponse(actErr);
+      const activatedEvent =
+        activatedRes && typeof activatedRes === 'object' && 'event' in activatedRes
+          ? (activatedRes as { event: Event }).event
+          : { ...data, is_active: true };
+      return NextResponse.json({ event: activatedEvent }, { status: 201 });
+    }
+
     return NextResponse.json({ event: data }, { status: 201 });
   } catch (err) {
     return rpcErrorResponse(err);
@@ -92,14 +102,19 @@ export async function PATCH(req: Request) {
       );
     }
 
-    if (updates.is_active === true && !existing.is_active) {
-      await admin.from('events').update({ is_active: false }).eq('is_active', true).neq('id', id);
+    const { is_active: requestedActive, ...remainingUpdates } = updates;
+    const activationRequested = requestedActive === true && !existing.is_active;
+
+    if (activationRequested) {
+      const { error: actErr } = await admin.rpc('activate_event', { p_event_id: id });
+      if (actErr) return rpcErrorResponse(actErr);
     }
 
+    const patchFields = activationRequested ? remainingUpdates : updates;
     const { data: updated, error: updateErr } = await admin
       .from('events')
       .update({
-        ...updates,
+        ...patchFields,
         updated_at: new Date().toISOString(),
       })
       .eq('id', id)
