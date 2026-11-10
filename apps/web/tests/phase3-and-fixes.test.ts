@@ -23,6 +23,10 @@ vi.mock('@/lib/supabase/admin', () => ({
   })),
 }));
 
+import {
+  resolvePrizeSpeedMode,
+  suggestDefaultSpeedModeForNewPrize,
+} from '@church/shared';
 import { resetRateLimiter } from '@/lib/rate-limit';
 import { POST as activateEventPost } from '@/app/api/admin/activate-event/route';
 import { POST as importConfigPost } from '@/app/api/admin/import-config/route';
@@ -44,6 +48,17 @@ import {
   computeRevealSchedule,
   evaluateRevealTimeline,
 } from '@/lib/reveal-timeline';
+import {
+  createInitialFpsDowngradeState,
+  downgradeQualityPreset,
+  stepFpsDowngradeState,
+} from '@/lib/quality-monitor';
+import { getStageThemeSpec } from '@/components/three/stage-themes';
+import { classifySwFetchRequest } from '@/lib/sw-policy';
+import {
+  evaluateRehearsalChecklist,
+  type ChecklistServerData,
+} from '@/lib/checklist';
 import {
   buildBallSpawnPositions,
   CAGE_BOUNDARY_RADIUS,
@@ -555,10 +570,16 @@ describe('Phase 2 Hardening Fixes & Phase 3 Display Controller', () => {
     }
   });
 
-  it('nextQualityPreset cycles smoothly and computeStageCameraFit adapts cleanly for N=3..7 digits', () => {
+  it('nextQualityPreset cycles all 4 tiers smoothly and computeStageCameraFit adapts cleanly for N=3..7 digits', () => {
     expect(nextQualityPreset('high')).toBe('medium');
-    expect(nextQualityPreset('medium')).toBe('low');
+    expect(nextQualityPreset('medium')).toBe('light');
+    expect(nextQualityPreset('light')).toBe('low');
     expect(nextQualityPreset('low')).toBe('high');
+
+    expect(downgradeQualityPreset('high')).toBe('medium');
+    expect(downgradeQualityPreset('medium')).toBe('light');
+    expect(downgradeQualityPreset('light')).toBe('low');
+    expect(downgradeQualityPreset('low')).toBeNull();
 
     const fit3 = computeStageCameraFit({ digits: 3, aspect: 16 / 9 });
     const fit5 = computeStageCameraFit({ digits: 5, aspect: 16 / 9 });
@@ -661,5 +682,233 @@ describe('Phase 2 Hardening Fixes & Phase 3 Display Controller', () => {
         CAGE_BOUNDARY_RADIUS
       )
     ).toBe(true);
+  });
+
+  it('Phase 5/6 speed modes pace fast (~8s) vs full (~17s) and default top prizes to full', () => {
+    for (const digits of [3, 4, 5, 6, 7]) {
+      const fast = computeRevealSchedule(digits, 'fast');
+      const full = computeRevealSchedule(digits, 'full');
+      expect(fast.totalDurationSec).toBeGreaterThanOrEqual(7.0);
+      expect(fast.totalDurationSec).toBeLessThanOrEqual(9.0);
+      expect(full.totalDurationSec).toBeGreaterThanOrEqual(15.0);
+      expect(full.totalDurationSec).toBeLessThanOrEqual(20.0);
+
+      // Final digit remains hidden right before fast reveal completes
+      const preReveal = evaluateRevealTimeline(digits, fast.finalRevealAtSec - 0.05, 'fast');
+      expect(preReveal.revealedDigits).toBe(digits - 1);
+      expect(preReveal.isFinalRevealVisible).toBe(false);
+    }
+
+    const prizes = [
+      { id: 'p1', name: 'Giải Khuyến Khích', quantity: 10, sort_order: 0, speed_mode: null },
+      { id: 'p2', name: 'Giải Ba', quantity: 3, sort_order: 1, speed_mode: null },
+      { id: 'p3', name: 'Giải Đặc Biệt', quantity: 1, sort_order: 2, speed_mode: null },
+      { id: 'p4', name: 'Giải Tùy Chỉnh', quantity: 2, sort_order: 3, speed_mode: 'fast' as const },
+    ];
+    expect(resolvePrizeSpeedMode(prizes[0], prizes)).toBe('fast');
+    expect(resolvePrizeSpeedMode(prizes[2], prizes)).toBe('full');
+    expect(resolvePrizeSpeedMode(prizes[3], prizes)).toBe('fast');
+
+    expect(
+      suggestDefaultSpeedModeForNewPrize({
+        name: 'Giải Khuyến Khích',
+        quantity: 10,
+        sortOrder: 0,
+        existingPrizes: [{ sort_order: 1 }],
+      })
+    ).toBe('fast');
+    expect(
+      suggestDefaultSpeedModeForNewPrize({
+        name: 'Giải Đặc Biệt',
+        quantity: 1,
+        sortOrder: 4,
+        existingPrizes: [{ sort_order: 0 }],
+      })
+    ).toBe('full');
+  });
+
+  it('FPS quality monitor ignores warmup/hidden frames and downgrades cleanly below 40 FPS sustained', () => {
+    let monitor = createInitialFpsDowngradeState(3.5);
+
+    // Warmup frames (even low FPS) must not trigger downgrade
+    for (let i = 0; i < 6; i++) {
+      const step = stepFpsDowngradeState(monitor, { fps: 18, windowSec: 0.5 });
+      monitor = step.nextState;
+      expect(step.shouldDowngrade).toBe(false);
+    }
+
+    // Hidden browser tab samples must not advance accumulator
+    const hiddenStep = stepFpsDowngradeState(monitor, {
+      fps: 5,
+      windowSec: 2.0,
+      isHidden: true,
+    });
+    expect(hiddenStep.nextState).toEqual(monitor);
+    expect(hiddenStep.shouldDowngrade).toBe(false);
+
+    // Burn final 0.5s of warmup
+    monitor = stepFpsDowngradeState(monitor, { fps: 60, windowSec: 0.5 }).nextState;
+
+    // Sustained <40 FPS for ~4s should trigger downgrade exactly once and enter cooldown
+    let triggeredAt = -1;
+    for (let i = 1; i <= 10; i++) {
+      const step = stepFpsDowngradeState(monitor, { fps: 28, windowSec: 0.5 });
+      monitor = step.nextState;
+      if (step.shouldDowngrade) {
+        triggeredAt = i;
+        break;
+      }
+    }
+    expect(triggeredAt).toBe(8);
+    expect(monitor.cooldownRemainingSec).toBeGreaterThan(5);
+
+    // During cooldown even low FPS will not cascade-downgrade immediately
+    const duringCooldown = stepFpsDowngradeState(monitor, { fps: 20, windowSec: 1.0 });
+    expect(duringCooldown.shouldDowngrade).toBe(false);
+  });
+
+  it('getStageThemeSpec configures christmas (snow) and easter (petals) palettes and particles', () => {
+    const classic = getStageThemeSpec('classic');
+    const christmas = getStageThemeSpec('christmas');
+    const easter = getStageThemeSpec('easter');
+
+    expect(classic.particleMode).toBe('gold-dust');
+    expect(christmas.particleMode).toBe('snow');
+    expect(easter.particleMode).toBe('petals');
+    expect(christmas.skyColor).not.toBe(classic.skyColor);
+    expect(easter.petalColors.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('Service Worker policy and public/sw.js NEVER cache /api/* responses, /auth/*, or non-GET calls', () => {
+    const origin = 'http://localhost:3000';
+    expect(
+      classifySwFetchRequest({
+        method: 'GET',
+        requestOrigin: origin,
+        currentOrigin: origin,
+        pathname: '/api/display/state',
+      })
+    ).toBe('bypass-network');
+    expect(
+      classifySwFetchRequest({
+        method: 'POST',
+        requestOrigin: origin,
+        currentOrigin: origin,
+        pathname: '/api/draw/next',
+      })
+    ).toBe('bypass-network');
+    expect(
+      classifySwFetchRequest({
+        method: 'GET',
+        requestOrigin: origin,
+        currentOrigin: origin,
+        pathname: '/auth/callback',
+      })
+    ).toBe('bypass-network');
+    expect(
+      classifySwFetchRequest({
+        method: 'GET',
+        requestOrigin: 'https://demo.supabase.co',
+        currentOrigin: origin,
+        pathname: '/rest/v1/draws',
+      })
+    ).toBe('bypass-network');
+    expect(
+      classifySwFetchRequest({
+        method: 'GET',
+        requestOrigin: origin,
+        currentOrigin: origin,
+        pathname: '/display',
+      })
+    ).toBe('doc-network-first');
+    expect(
+      classifySwFetchRequest({
+        method: 'GET',
+        requestOrigin: origin,
+        currentOrigin: origin,
+        pathname: '/sounds/ting.wav',
+      })
+    ).toBe('asset-stale-revalidate');
+
+    const swSource = fs.readFileSync(path.resolve(process.cwd(), 'public/sw.js'), 'utf8');
+    expect(swSource).toContain("pathname === '/api'");
+    expect(swSource).toContain("pathname.startsWith('/api/')");
+    expect(swSource).toContain('if (isBypassPath(url.pathname))');
+    expect(swSource).toContain("if (request.method !== 'GET') return;");
+  });
+
+  it('evaluateRehearsalChecklist verifies all 6 pre-event readiness checks accurately', () => {
+    const baseEvent = {
+      id: EVENT_ID,
+      title: 'Đêm Hội Giáng Sinh 2026',
+      parish_name: 'Giáo Xứ Xuân Phước',
+      digits: 5,
+      range_from: 1,
+      range_to: 1000,
+      theme: 'christmas' as const,
+      primary_color: '#F5C451',
+      test_mode: false,
+      status: 'active' as const,
+      is_active: true,
+    };
+    const baseServer: ChecklistServerData = {
+      generatedAt: '2026-11-10T10:00:00Z',
+      activeEvent: baseEvent,
+      targetEvent: baseEvent,
+      prizes: [
+        {
+          id: PRIZE_ID,
+          event_id: EVENT_ID,
+          name: 'Giải Đặc Biệt',
+          reward: 'Xe máy',
+          quantity: 1,
+          sort_order: 0,
+          speed_mode: 'full',
+        },
+      ],
+      totalPoolSize: 1000,
+      excludedInRangeCount: 0,
+      validInitialPool: 1000,
+      totalPrizeQuantity: 1,
+      quotaExceedsPool: false,
+      testDrawsCount: 0,
+      realDrawsCount: 0,
+      presenterUsers: [
+        {
+          id: 'pres-1',
+          email: 'xuanphuoc@giaoxu.vn',
+          last_sign_in_at: '2026-11-10T09:50:00Z',
+        },
+      ],
+    };
+
+    const ready = evaluateRehearsalChecklist(baseServer, {
+      audioUnlockedAt: '2026-11-10T09:55:00Z',
+      backupJsonExportedAt: '2026-11-10T09:56:00Z',
+      backupLaptopReady: true,
+    });
+    expect(ready).toHaveLength(6);
+    expect(ready.every((item) => item.status === 'pass')).toBe(true);
+
+    // Dirty rehearsal state (test_mode still true, test draws lingering, presenter never signed in)
+    const notReady = evaluateRehearsalChecklist(
+      {
+        ...baseServer,
+        activeEvent: { ...baseEvent, test_mode: true },
+        targetEvent: { ...baseEvent, test_mode: true },
+        testDrawsCount: 4,
+        presenterUsers: [{ id: 'pres-1', email: 'xuanphuoc@giaoxu.vn', last_sign_in_at: null }],
+      },
+      {
+        audioUnlockedAt: null,
+        backupJsonExportedAt: null,
+        backupLaptopReady: false,
+      }
+    );
+    expect(notReady.find((i) => i.key === 'real_event_active')?.status).toBe('warn');
+    expect(notReady.find((i) => i.key === 'test_mode_cleared')?.status).toBe('fail');
+    expect(notReady.find((i) => i.key === 'audio_unlocked')?.status).toBe('warn');
+    expect(notReady.find((i) => i.key === 'presenter_logged_in')?.status).toBe('warn');
+    expect(notReady.find((i) => i.key === 'backup_laptop')?.status).toBe('warn');
   });
 });

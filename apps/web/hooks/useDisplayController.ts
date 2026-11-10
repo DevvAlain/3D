@@ -3,11 +3,13 @@
 import * as React from 'react';
 import {
   formatTicket,
+  resolvePrizeSpeedMode,
   type DisplayStatePayload,
   type Draw,
   type DrawNextResult,
   type Prize,
   type PrizeProgress,
+  type PrizeSpeedMode,
 } from '@church/shared';
 import { resolveDrawNextClientTransition } from '@/lib/display-state';
 import { DisplaySoundEngine } from '@/lib/sound-engine';
@@ -16,16 +18,21 @@ import {
   evaluateRevealTimeline,
   type RevealTimelineSnapshot,
 } from '@/lib/reveal-timeline';
+import {
+  downgradeQualityPreset,
+  nextQualityPreset,
+  QUALITY_LABELS,
+  type DisplayQualityPreset,
+} from '@/lib/quality-monitor';
+import {
+  preloadStageAssets,
+  STAGE_SOUND_ASSETS,
+  type AssetPreloadProgress,
+} from '@/lib/asset-preloader';
 
-export type DisplayQualityPreset = 'high' | 'medium' | 'low';
+export { nextQualityPreset, type DisplayQualityPreset };
 
 export const ACTION_COOLDOWN_MS = 900;
-
-export function nextQualityPreset(current: DisplayQualityPreset): DisplayQualityPreset {
-  if (current === 'high') return 'medium';
-  if (current === 'medium') return 'low';
-  return 'high';
-}
 
 export function shouldIgnoreStageKeyboardAction(params: {
   key: string;
@@ -138,15 +145,56 @@ export interface DisplayNotice {
   text: string;
 }
 
+export interface PendingRetryAction {
+  kind: 'next' | 'confirm' | 'absent' | 'undo-absent' | 'void-last';
+  label: string;
+  run: () => Promise<void>;
+}
+
 export interface BetweenPrizesTransition {
   completedPrize: PrizeProgress;
   nextPrize: PrizeProgress;
   winners: DisplayStatePayload['wonDraws'];
 }
 
-function buildIdleSnapshot(digits: number, restoredReveal: boolean): RevealTimelineSnapshot {
+function getPendingDrawStorageKey(eventId: string, testMode: boolean): string {
+  return `church_pending_draw_key_${eventId}_${testMode ? 'test' : 'real'}`;
+}
+
+function readStoredPendingDrawKey(eventId: string, testMode: boolean): string | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    return window.sessionStorage.getItem(getPendingDrawStorageKey(eventId, testMode));
+  } catch {
+    return null;
+  }
+}
+
+function writeStoredPendingDrawKey(
+  eventId: string,
+  testMode: boolean,
+  key: string | null
+): void {
+  if (typeof window === 'undefined') return;
+  try {
+    const storageKey = getPendingDrawStorageKey(eventId, testMode);
+    if (key) {
+      window.sessionStorage.setItem(storageKey, key);
+    } else {
+      window.sessionStorage.removeItem(storageKey);
+    }
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function buildIdleSnapshot(
+  digits: number,
+  restoredReveal: boolean,
+  speedMode: PrizeSpeedMode = 'full'
+): RevealTimelineSnapshot {
+  const schedule = computeRevealSchedule(digits, speedMode);
   if (restoredReveal) {
-    const schedule = computeRevealSchedule(digits);
     return {
       digits: schedule.digits,
       elapsedSec: schedule.totalDurationSec,
@@ -166,10 +214,10 @@ function buildIdleSnapshot(digits: number, restoredReveal: boolean): RevealTimel
     };
   }
   return {
-    digits,
+    digits: schedule.digits,
     elapsedSec: 0,
-    totalDurationSec: computeRevealSchedule(digits).totalDurationSec,
-    finalRevealAtSec: computeRevealSchedule(digits).finalRevealAtSec,
+    totalDurationSec: schedule.totalDurationSec,
+    finalRevealAtSec: schedule.finalRevealAtSec,
     phase: 'idle',
     revealedDigits: 0,
     justLandedDigitIndex: null,
@@ -190,8 +238,11 @@ export interface DisplayController {
   actorEmail: string;
   stageUnlocked: boolean;
   unlockStage: () => void;
+  assetsProgress: AssetPreloadProgress;
   revealedDigits: number;
   isAnimating: boolean;
+  activeDrawSpeedMode: PrizeSpeedMode;
+  currentPrizeSpeedMode: PrizeSpeedMode;
   isFinalRevealVisible: boolean;
   activeRevealTicketDigits: number[];
   revealTimelineRef: React.MutableRefObject<RevealTimelineSnapshot>;
@@ -201,6 +252,8 @@ export interface DisplayController {
   submittingAction: string | null;
   isInCooldown: boolean;
   connectionStatus: 'online' | 'syncing' | 'offline';
+  pendingRetryAction: PendingRetryAction | null;
+  retryPendingAction: () => Promise<void>;
   notice: DisplayNotice | null;
   clearNotice: () => void;
   isFullscreen: boolean;
@@ -208,6 +261,7 @@ export interface DisplayController {
   quality: DisplayQualityPreset;
   setQuality: (q: DisplayQualityPreset) => void;
   cycleQuality: () => void;
+  handleAutoDowngradeQuality: (measuredFps: number) => void;
   webglSupported: boolean;
   webglContextLost: boolean;
   handleWebGLContextLost: () => void;
@@ -238,13 +292,27 @@ export function useDisplayController(params: {
 
   const initialDigits = initialState.event?.digits ?? 5;
   const hasRestoredReveal = Boolean(initialState.currentDraw && initialState.event);
+  const initialSpeedMode: PrizeSpeedMode = resolvePrizeSpeedMode(
+    initialState.currentDraw?.prize ?? initialState.activePrize,
+    initialState.prizes
+  );
 
   const [state, setState] = React.useState<DisplayStatePayload>(initialState);
   const [stageUnlocked, setStageUnlocked] = React.useState<boolean>(isPreview);
+  const [assetsProgress, setAssetsProgress] = React.useState<AssetPreloadProgress>({
+    loaded: 0,
+    total: STAGE_SOUND_ASSETS.length + 2,
+    percent: 0,
+    currentLabel: 'Đang chuẩn bị tài nguyên sân khấu...',
+    done: false,
+    warnings: [],
+  });
   const [revealedDigits, setRevealedDigits] = React.useState<number>(() =>
     hasRestoredReveal ? initialDigits : 0
   );
   const [isAnimating, setIsAnimating] = React.useState<boolean>(false);
+  const [activeDrawSpeedMode, setActiveDrawSpeedMode] =
+    React.useState<PrizeSpeedMode>(initialSpeedMode);
   const [confettiBurstKey, setConfettiBurstKey] = React.useState<number>(0);
   const [betweenPrizes, setBetweenPrizes] = React.useState<BetweenPrizesTransition | null>(null);
   const [submittingAction, setSubmittingAction] = React.useState<string | null>(null);
@@ -252,10 +320,12 @@ export function useDisplayController(params: {
   const [connectionStatus, setConnectionStatus] = React.useState<'online' | 'syncing' | 'offline'>(
     'online'
   );
+  const [pendingRetryAction, setPendingRetryAction] =
+    React.useState<PendingRetryAction | null>(null);
   const [notice, setNotice] = React.useState<DisplayNotice | null>(null);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
 
-  // Default to "Trung bình (3D)" until automated FPS benchmarking is added
+  // Default to "Trung bình (3D)" until auto-downgrade or user Q selection switches preset
   const [quality, setQualityState] = React.useState<DisplayQualityPreset>('medium');
   const [webglSupported, setWebglSupported] = React.useState<boolean>(true);
   const [webglContextLost, setWebglContextLost] = React.useState<boolean>(false);
@@ -264,6 +334,7 @@ export function useDisplayController(params: {
 
   const pendingDrawKeyRef = React.useRef<string | null>(null);
   const activeDrawIdRef = React.useRef<string | null>(initialState.currentDraw?.id ?? null);
+  const activeDrawSpeedRef = React.useRef<PrizeSpeedMode>(initialSpeedMode);
   const rafIdRef = React.useRef<number | null>(null);
   const burstTailRafRef = React.useRef<number | null>(null);
   const revealStartMsRef = React.useRef<number>(0);
@@ -271,7 +342,7 @@ export function useDisplayController(params: {
   const lastSuspenseTickRef = React.useRef<number>(0);
   const finaleTriggeredRef = React.useRef<boolean>(hasRestoredReveal);
   const revealTimelineRef = React.useRef<RevealTimelineSnapshot>(
-    buildIdleSnapshot(initialDigits, hasRestoredReveal)
+    buildIdleSnapshot(initialDigits, hasRestoredReveal, initialSpeedMode)
   );
   const isAnimatingRef = React.useRef<boolean>(false);
   const submittingRef = React.useRef<string | null>(null);
@@ -296,30 +367,58 @@ export function useDisplayController(params: {
     }
   }, []);
 
-  // Detect WebGL & load preferred quality preset on mount
+  // Detect WebGL, restore saved quality + pending idempotency key, preload assets & sound engine
   React.useEffect(() => {
     const supported = detectWebGLAvailability();
     setWebglSupported(supported);
 
+    let initialQuality: DisplayQualityPreset = 'medium';
     try {
       const saved = window.localStorage.getItem('church_display_quality');
-      if (saved === 'high' || saved === 'medium' || saved === 'low') {
+      if (saved === 'high' || saved === 'medium' || saved === 'light' || saved === 'low') {
+        initialQuality = saved;
         setQualityState(saved);
       }
     } catch {
       // Ignore storage failures
     }
 
+    if (initialState.event?.id) {
+      const storedKey = readStoredPendingDrawKey(
+        initialState.event.id,
+        initialState.event.test_mode
+      );
+      if (storedKey && !initialState.currentDraw) {
+        pendingDrawKeyRef.current = storedKey;
+      }
+    }
+
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      setConnectionStatus('offline');
+    }
+
     const engine = new DisplaySoundEngine();
     soundEngineRef.current = engine;
 
+    let disposed = false;
+    void preloadStageAssets({
+      bgMusicUrl: initialState.event?.bg_music_url ?? null,
+      includeWasm: supported && initialQuality !== 'low',
+      onProgress: (p) => {
+        if (!disposed) {
+          setAssetsProgress(p);
+        }
+      },
+    });
+
     return () => {
+      disposed = true;
       cancelAllAnimationLoops();
       engine.dispose();
       soundEngineRef.current = null;
       if (cooldownTimerRef.current !== null) window.clearTimeout(cooldownTimerRef.current);
     };
-  }, [cancelAllAnimationLoops]);
+  }, [cancelAllAnimationLoops, initialState.event?.bg_music_url, initialState.event?.id, initialState.event?.test_mode, initialState.currentDraw]);
 
   React.useEffect(() => {
     if (stageUnlocked) {
@@ -360,6 +459,23 @@ export function useDisplayController(params: {
     });
   }, []);
 
+  const handleAutoDowngradeQuality = React.useCallback((measuredFps: number) => {
+    setQualityState((prev) => {
+      const downgraded = downgradeQualityPreset(prev);
+      if (!downgraded) return prev;
+      try {
+        window.localStorage.setItem('church_display_quality', downgraded);
+      } catch {
+        // Ignore storage errors
+      }
+      setNotice({
+        type: 'info',
+        text: `Phát hiện tốc độ khung hình thấp (~${measuredFps} FPS) — đã tự động giảm đồ họa từ ${QUALITY_LABELS[prev]} xuống ${QUALITY_LABELS[downgraded]} để giữ trình chiếu mượt mà.`,
+      });
+      return downgraded;
+    });
+  }, []);
+
   const handleWebGLContextLost = React.useCallback(() => {
     setWebglContextLost(true);
     setNotice({
@@ -383,37 +499,47 @@ export function useDisplayController(params: {
   const unlockStage = React.useCallback(() => {
     setStageUnlocked(true);
     soundEngineRef.current?.unlock(event?.bg_music_url ?? null);
+    try {
+      window.localStorage.setItem('church_checklist_audio_unlocked', new Date().toISOString());
+    } catch {
+      // Ignore storage errors
+    }
   }, [event?.bg_music_url]);
 
   const dismissBetweenPrizes = React.useCallback(() => {
     setBetweenPrizes(null);
   }, []);
 
-  const startBurstTail = React.useCallback((totalDigits: number, startOffsetSec: number) => {
-    const startMs = performance.now();
-    const runTailFrame = () => {
-      const elapsedTail = (performance.now() - startMs) / 1000;
-      const snap = evaluateRevealTimeline(totalDigits, startOffsetSec + elapsedTail);
-      revealTimelineRef.current = snap;
-      if (!snap.isComplete) {
-        burstTailRafRef.current = window.requestAnimationFrame(runTailFrame);
-      } else {
-        burstTailRafRef.current = null;
-      }
-    };
-    revealTimelineRef.current = evaluateRevealTimeline(totalDigits, startOffsetSec);
-    burstTailRafRef.current = window.requestAnimationFrame(runTailFrame);
-  }, []);
+  const startBurstTail = React.useCallback(
+    (totalDigits: number, startOffsetSec: number, speedMode: PrizeSpeedMode) => {
+      const startMs = performance.now();
+      const runTailFrame = () => {
+        const elapsedTail = (performance.now() - startMs) / 1000;
+        const snap = evaluateRevealTimeline(totalDigits, startOffsetSec + elapsedTail, speedMode);
+        revealTimelineRef.current = snap;
+        if (!snap.isComplete) {
+          burstTailRafRef.current = window.requestAnimationFrame(runTailFrame);
+        } else {
+          burstTailRafRef.current = null;
+        }
+      };
+      revealTimelineRef.current = evaluateRevealTimeline(totalDigits, startOffsetSec, speedMode);
+      burstTailRafRef.current = window.requestAnimationFrame(runTailFrame);
+    },
+    []
+  );
 
   const stopRevealAnimation = React.useCallback(
-    (totalDigits: number, restoredReveal: boolean) => {
+    (totalDigits: number, restoredReveal: boolean, speedMode: PrizeSpeedMode = 'full') => {
       cancelAllAnimationLoops();
       soundEngineRef.current?.stopDrumRoll();
       isAnimatingRef.current = false;
       lastReportedDigitsRef.current = restoredReveal ? totalDigits : 0;
       lastSuspenseTickRef.current = 0;
       finaleTriggeredRef.current = restoredReveal;
-      revealTimelineRef.current = buildIdleSnapshot(totalDigits, restoredReveal);
+      activeDrawSpeedRef.current = speedMode;
+      setActiveDrawSpeedMode(speedMode);
+      revealTimelineRef.current = buildIdleSnapshot(totalDigits, restoredReveal, speedMode);
       setRevealedDigits(restoredReveal ? totalDigits : 0);
       setIsAnimating(false);
     },
@@ -425,7 +551,8 @@ export function useDisplayController(params: {
     if (!isAnimatingRef.current) return;
     cancelAllAnimationLoops();
 
-    const schedule = computeRevealSchedule(digits);
+    const speedMode = activeDrawSpeedRef.current;
+    const schedule = computeRevealSchedule(digits, speedMode);
     isAnimatingRef.current = false;
     lastReportedDigitsRef.current = digits;
     setRevealedDigits(digits);
@@ -440,19 +567,21 @@ export function useDisplayController(params: {
       soundEngineRef.current?.stopDrumRoll();
     }
 
-    startBurstTail(digits, schedule.finalRevealAtSec);
+    startBurstTail(digits, schedule.finalRevealAtSec, speedMode);
     beginCooldown();
   }, [digits, cancelAllAnimationLoops, startBurstTail, beginCooldown]);
 
   const startRevealAnimation = React.useCallback(
-    (totalDigits: number) => {
+    (totalDigits: number, speedMode: PrizeSpeedMode) => {
       cancelAllAnimationLoops();
       isAnimatingRef.current = true;
       lastReportedDigitsRef.current = 0;
       lastSuspenseTickRef.current = 0;
       finaleTriggeredRef.current = false;
+      activeDrawSpeedRef.current = speedMode;
+      setActiveDrawSpeedMode(speedMode);
       revealStartMsRef.current = performance.now();
-      revealTimelineRef.current = evaluateRevealTimeline(totalDigits, 0);
+      revealTimelineRef.current = evaluateRevealTimeline(totalDigits, 0, speedMode);
 
       setRevealedDigits(0);
       setIsAnimating(true);
@@ -460,7 +589,7 @@ export function useDisplayController(params: {
 
       const stepFrame = () => {
         const elapsedSec = (performance.now() - revealStartMsRef.current) / 1000;
-        const snap = evaluateRevealTimeline(totalDigits, elapsedSec);
+        const snap = evaluateRevealTimeline(totalDigits, elapsedSec, speedMode);
         revealTimelineRef.current = snap;
 
         if (snap.phase === 'final-suspense') {
@@ -481,7 +610,7 @@ export function useDisplayController(params: {
           soundEngineRef.current?.playTing();
           soundEngineRef.current?.playFanfare();
           setConfettiBurstKey((k) => k + 1);
-          startBurstTail(totalDigits, snap.elapsedSec);
+          startBurstTail(totalDigits, snap.elapsedSec, speedMode);
           return;
         }
 
@@ -501,6 +630,11 @@ export function useDisplayController(params: {
 
   // Poll /api/display/state every 4s (ZERO Supabase Realtime on /display)
   const refreshState = React.useCallback(async (): Promise<DisplayStatePayload | null> => {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      setConnectionStatus('offline');
+      return null;
+    }
+
     try {
       setConnectionStatus((prev) => (prev === 'offline' ? 'offline' : 'syncing'));
       const url = isPreview ? '/api/display/state?preview=1' : '/api/display/state';
@@ -511,6 +645,13 @@ export function useDisplayController(params: {
       }
       const nextState = (await res.json()) as DisplayStatePayload;
       setConnectionStatus('online');
+      setPendingRetryAction((prev) => {
+        if (!prev) return null;
+        if (prev.kind === 'next' && nextState.currentDraw) return null;
+        if ((prev.kind === 'confirm' || prev.kind === 'absent') && !nextState.currentDraw) return null;
+        if (prev.kind === 'undo-absent' && nextState.currentDraw) return null;
+        return prev;
+      });
 
       // Guard against mid-flight `/api/draw/next` or active animation so numbers NEVER flash
       if (submittingRef.current === 'next' || isAnimatingRef.current) {
@@ -519,14 +660,24 @@ export function useDisplayController(params: {
 
       setState(nextState);
 
+      const resolvedSpeed = resolvePrizeSpeedMode(
+        nextState.currentDraw?.prize ?? nextState.activePrize,
+        nextState.prizes
+      );
+
       if (nextState.currentDraw && nextState.event) {
+        // Clear pending draw idempotency key once the revealing draw appears safely on server
+        if (nextState.event.id) {
+          pendingDrawKeyRef.current = null;
+          writeStoredPendingDrawKey(nextState.event.id, nextState.event.test_mode, null);
+        }
         if (nextState.currentDraw.id !== activeDrawIdRef.current) {
           activeDrawIdRef.current = nextState.currentDraw.id;
-          stopRevealAnimation(nextState.event.digits, true);
+          stopRevealAnimation(nextState.event.digits, true, resolvedSpeed);
         }
       } else if (activeDrawIdRef.current !== null || burstTailRafRef.current === null) {
         activeDrawIdRef.current = null;
-        stopRevealAnimation(nextState.event?.digits ?? digits, false);
+        stopRevealAnimation(nextState.event?.digits ?? digits, false, resolvedSpeed);
       }
 
       return nextState;
@@ -541,6 +692,29 @@ export function useDisplayController(params: {
       void refreshState();
     }, 4000);
     return () => window.clearInterval(id);
+  }, [refreshState]);
+
+  React.useEffect(() => {
+    const onOffline = () => {
+      setConnectionStatus('offline');
+      setNotice({
+        type: 'error',
+        text: 'Mất kết nối mạng (Offline) — Kết quả đã lưu trên máy chủ vẫn an toàn. Vui lòng kiểm tra Wi-Fi/LAN và bấm thử lại khi có mạng.',
+      });
+    };
+    const onOnline = () => {
+      setNotice({
+        type: 'info',
+        text: 'Đã kết nối mạng trở lại — đang đồng bộ trạng thái sân khấu với máy chủ...',
+      });
+      void refreshState();
+    };
+    window.addEventListener('offline', onOffline);
+    window.addEventListener('online', onOnline);
+    return () => {
+      window.removeEventListener('offline', onOffline);
+      window.removeEventListener('online', onOnline);
+    };
   }, [refreshState]);
 
   React.useEffect(() => {
@@ -576,9 +750,11 @@ export function useDisplayController(params: {
     setBetweenPrizes(null);
 
     if (!pendingDrawKeyRef.current) {
-      pendingDrawKeyRef.current = crypto.randomUUID();
+      pendingDrawKeyRef.current =
+        readStoredPendingDrawKey(event.id, event.test_mode) ?? crypto.randomUUID();
     }
     const idempotencyKey = pendingDrawKeyRef.current;
+    writeStoredPendingDrawKey(event.id, event.test_mode, idempotencyKey);
 
     submittingRef.current = 'next';
     setSubmittingAction('next');
@@ -594,16 +770,25 @@ export function useDisplayController(params: {
 
       if (networkFailed || !response) {
         setConnectionStatus('offline');
+        setPendingRetryAction({
+          kind: 'next',
+          label: 'Thử quay lại (giữ nguyên mã phiên)',
+          run: () => handleDrawNext(),
+        });
         setNotice({
           type: 'error',
-          text: 'Mất kết nối máy chủ sau nhiều lần thử lại — đã giữ nguyên mã lượt quay để bạn bấm lại an toàn.',
+          text: 'Mất kết nối máy chủ — đã giữ nguyên mã idempotency của lượt quay này để chống trùng lặp khi gửi lại.',
         });
         return;
       }
 
+      setConnectionStatus('online');
+      setPendingRetryAction(null);
+
       if (!response.ok) {
         if (response.status < 500) {
           pendingDrawKeyRef.current = null;
+          writeStoredPendingDrawKey(event.id, event.test_mode, null);
         }
         const errMsg =
           json && typeof json.error === 'string' ? json.error : 'Không thể quay lượt tiếp theo.';
@@ -615,6 +800,7 @@ export function useDisplayController(params: {
       const result = json as unknown as DrawNextResult;
       const transition = resolveDrawNextClientTransition(result);
       pendingDrawKeyRef.current = null;
+      writeStoredPendingDrawKey(event.id, event.test_mode, null);
 
       if (transition.shouldRestoreOnly) {
         if (transition.noticeMessage) {
@@ -624,9 +810,11 @@ export function useDisplayController(params: {
         return;
       }
 
+      const speedMode = resolvePrizeSpeedMode(result.prize, state.prizes);
+
       // Start masked animation timeline synchronously BEFORE placing draw ticket in state
       activeDrawIdRef.current = result.draw.id;
-      startRevealAnimation(digits);
+      startRevealAnimation(digits, speedMode);
       soundEngineRef.current?.playSpinStart();
 
       const revealingWithPrize: Draw & { prize?: Prize } = {
@@ -649,8 +837,10 @@ export function useDisplayController(params: {
   }, [
     isPreview,
     event?.id,
+    event?.test_mode,
     currentDraw,
     state.isAllPrizesCompleted,
+    state.prizes,
     digits,
     startRevealAnimation,
     refreshState,
@@ -674,16 +864,41 @@ export function useDisplayController(params: {
     setSubmittingAction('confirm');
     setNotice(null);
     try {
-      const res = await fetch('/api/draw/confirm', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ draw_id: currentDraw.id }),
-      });
-      const json = await res.json();
-      if (!res.ok) {
-        setNotice({ type: 'error', text: json.error || 'Không thể xác nhận trúng thưởng.' });
-        await refreshState();
+      const { response, json, networkFailed } = await fetchPostWithIdempotentRetry(
+        '/api/draw/confirm',
+        { draw_id: currentDraw.id },
+        2,
+        650
+      );
+
+      if (networkFailed || !response) {
+        setConnectionStatus('offline');
+        setPendingRetryAction({
+          kind: 'confirm',
+          label: 'Thử xác nhận trúng lại',
+          run: () => handleConfirmWon(),
+        });
+        setNotice({
+          type: 'error',
+          text: 'Mất kết nối khi xác nhận trúng thưởng — kết quả quay số vẫn được giữ an toàn trên màn hình. Hãy thử gửi lại khi có mạng.',
+        });
         return;
+      }
+
+      setConnectionStatus('online');
+      setPendingRetryAction(null);
+
+      if (!response.ok) {
+        const refreshed = await refreshState();
+        const alreadySaved = refreshed?.wonDraws.some((w) => w.id === currentDraw.id) ?? false;
+        if (!alreadySaved) {
+          const errMsg =
+            json && typeof json.error === 'string'
+              ? json.error
+              : 'Không thể xác nhận trúng thưởng.';
+          setNotice({ type: 'error', text: errMsg });
+          return;
+        }
       }
 
       const nextState = await refreshState();
@@ -711,8 +926,6 @@ export function useDisplayController(params: {
           text: `Đã xác nhận vé ${formatTicket(currentDraw.ticket, digits)} trúng ${currentDraw.prize?.name ?? 'giải thưởng'}!`,
         });
       }
-    } catch {
-      setNotice({ type: 'error', text: 'Lỗi kết nối khi xác nhận trúng thưởng.' });
     } finally {
       submittingRef.current = null;
       setSubmittingAction(null);
@@ -743,24 +956,49 @@ export function useDisplayController(params: {
     setSubmittingAction('absent');
     setNotice(null);
     try {
-      const res = await fetch('/api/draw/absent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ draw_id: currentDraw.id }),
-      });
-      const json = await res.json();
-      if (!res.ok) {
-        setNotice({ type: 'error', text: json.error || 'Không thể đánh dấu vắng mặt.' });
-        await refreshState();
+      const { response, json, networkFailed } = await fetchPostWithIdempotentRetry(
+        '/api/draw/absent',
+        { draw_id: currentDraw.id },
+        2,
+        650
+      );
+
+      if (networkFailed || !response) {
+        setConnectionStatus('offline');
+        setPendingRetryAction({
+          kind: 'absent',
+          label: 'Thử gửi Vắng mặt lại',
+          run: () => handleMarkAbsent(),
+        });
+        setNotice({
+          type: 'error',
+          text: 'Mất kết nối khi đánh dấu vắng mặt — dữ liệu không bị mất, vui lòng thử lại khi kết nối ổn định.',
+        });
         return;
       }
+
+      setConnectionStatus('online');
+      setPendingRetryAction(null);
+
+      if (!response.ok) {
+        const refreshed = await refreshState();
+        const alreadyAbsent =
+          refreshed?.latestDraw?.id === currentDraw.id && refreshed.latestDraw.status === 'absent';
+        if (!alreadyAbsent) {
+          const errMsg =
+            json && typeof json.error === 'string'
+              ? json.error
+              : 'Không thể đánh dấu vắng mặt.';
+          setNotice({ type: 'error', text: errMsg });
+          return;
+        }
+      }
+
       setNotice({
         type: 'info',
         text: `Vé ${formatTicket(currentDraw.ticket, digits)} được đánh dấu Vắng mặt (không tính vào số lượng giải).`,
       });
       await refreshState();
-    } catch {
-      setNotice({ type: 'error', text: 'Lỗi kết nối khi đánh dấu vắng mặt.' });
     } finally {
       submittingRef.current = null;
       setSubmittingAction(null);
@@ -784,24 +1022,43 @@ export function useDisplayController(params: {
     setSubmittingAction('undo-absent');
     setNotice(null);
     try {
-      const res = await fetch('/api/draw/undo-absent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event_id: event.id }),
-      });
-      const json = await res.json();
-      if (!res.ok) {
-        setNotice({ type: 'error', text: json.error || 'Không thể hoàn tác vắng mặt.' });
+      const { response, json, networkFailed } = await fetchPostWithIdempotentRetry(
+        '/api/draw/undo-absent',
+        { event_id: event.id },
+        2,
+        650
+      );
+
+      if (networkFailed || !response) {
+        setConnectionStatus('offline');
+        setPendingRetryAction({
+          kind: 'undo-absent',
+          label: 'Thử hoàn tác lại',
+          run: () => handleUndoAbsent(),
+        });
+        setNotice({
+          type: 'error',
+          text: 'Mất kết nối khi hoàn tác vắng mặt — trạng thái trên máy chủ được bảo toàn.',
+        });
+        return;
+      }
+
+      setConnectionStatus('online');
+      setPendingRetryAction(null);
+
+      if (!response.ok) {
+        const errMsg =
+          json && typeof json.error === 'string' ? json.error : 'Không thể hoàn tác vắng mặt.';
+        setNotice({ type: 'error', text: errMsg });
         await refreshState();
         return;
       }
+
       setNotice({
         type: 'info',
         text: `Đã hoàn tác vé ${formatTicket(latestDraw.ticket, digits)} về trạng thái chờ xác nhận.`,
       });
       await refreshState();
-    } catch {
-      setNotice({ type: 'error', text: 'Lỗi kết nối khi hoàn tác vắng mặt.' });
     } finally {
       submittingRef.current = null;
       setSubmittingAction(null);
@@ -836,30 +1093,54 @@ export function useDisplayController(params: {
     setSubmittingAction('void-last');
     setNotice(null);
     try {
-      const res = await fetch('/api/draw/void-last', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event_id: event.id }),
-      });
-      const json = await res.json();
-      if (!res.ok) {
-        setNotice({ type: 'error', text: json.error || 'Không thể hủy lượt vừa quay.' });
+      const { response, json, networkFailed } = await fetchPostWithIdempotentRetry(
+        '/api/draw/void-last',
+        { event_id: event.id },
+        2,
+        650
+      );
+
+      if (networkFailed || !response) {
+        setConnectionStatus('offline');
+        setPendingRetryAction({
+          kind: 'void-last',
+          label: 'Thử hủy lượt lại',
+          run: () => handleVoidLast(),
+        });
+        setNotice({
+          type: 'error',
+          text: 'Mất kết nối khi hủy lượt quay — kết quả trên máy chủ vẫn được giữ nguyên.',
+        });
+        return;
+      }
+
+      setConnectionStatus('online');
+      setPendingRetryAction(null);
+
+      if (!response.ok) {
+        const errMsg =
+          json && typeof json.error === 'string' ? json.error : 'Không thể hủy lượt vừa quay.';
+        setNotice({ type: 'error', text: errMsg });
         await refreshState();
         return;
       }
+
       setNotice({
         type: 'info',
         text: `Đã hủy lượt quay vé ${formatTicket(latestDraw.ticket, digits)} và trả số vé lại rổ quay.`,
       });
       await refreshState();
-    } catch {
-      setNotice({ type: 'error', text: 'Lỗi kết nối khi hủy lượt vừa quay.' });
     } finally {
       submittingRef.current = null;
       setSubmittingAction(null);
       beginCooldown();
     }
   }, [isPreview, event?.id, latestDraw, digits, refreshState, beginCooldown]);
+
+  const retryPendingAction = React.useCallback(async () => {
+    if (!pendingRetryAction) return;
+    await pendingRetryAction.run();
+  }, [pendingRetryAction]);
 
   // Keyboard shortcuts (Space fast-forwards during animation, arrows/Enter stay locked during animation)
   React.useEffect(() => {
@@ -994,6 +1275,11 @@ export function useDisplayController(params: {
       .map((ch) => Number(ch));
   }, [currentDraw, event]);
 
+  const currentPrizeSpeedMode = React.useMemo(
+    () => resolvePrizeSpeedMode(currentDraw?.prize ?? activePrize, state.prizes),
+    [currentDraw?.prize, activePrize, state.prizes]
+  );
+
   const isFinalRevealVisible = Boolean(currentDraw && !isAnimating && revealedDigits >= digits);
   const shouldRender3D = webglSupported && !webglContextLost && quality !== 'low';
 
@@ -1003,8 +1289,11 @@ export function useDisplayController(params: {
     actorEmail,
     stageUnlocked,
     unlockStage,
+    assetsProgress,
     revealedDigits,
     isAnimating,
+    activeDrawSpeedMode,
+    currentPrizeSpeedMode,
     isFinalRevealVisible,
     activeRevealTicketDigits,
     revealTimelineRef,
@@ -1014,6 +1303,8 @@ export function useDisplayController(params: {
     submittingAction,
     isInCooldown,
     connectionStatus,
+    pendingRetryAction,
+    retryPendingAction,
     notice,
     clearNotice: () => setNotice(null),
     isFullscreen,
@@ -1021,6 +1312,7 @@ export function useDisplayController(params: {
     quality,
     setQuality,
     cycleQuality,
+    handleAutoDowngradeQuality,
     webglSupported,
     webglContextLost,
     handleWebGLContextLost,

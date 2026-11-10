@@ -10,8 +10,9 @@ import {
   useBeforePhysicsStep,
   type RapierRigidBody,
 } from '@react-three/rapier';
-import type { DisplayQualityPreset } from '@/hooks/useDisplayController';
+import type { DisplayQualityPreset } from '@/lib/quality-monitor';
 import type { RevealTimelineSnapshot } from '@/lib/reveal-timeline';
+import type { StageThemeSpec } from '@/components/three/stage-themes';
 import {
   createBallDigitTexture,
   disposeTextureList,
@@ -35,6 +36,7 @@ interface LotteryCageAndBallsProps {
   isSpinBoost: boolean;
   digits: number;
   activeRevealTicketDigits: number[];
+  themeSpec: StageThemeSpec;
   revealTimelineRef: React.MutableRefObject<RevealTimelineSnapshot>;
 }
 
@@ -80,6 +82,7 @@ interface LotteryBallBodyProps {
   radius: number;
   texture: THREE.CanvasTexture;
   envIntensity: number;
+  isLight: boolean;
   registerBody: (id: number, body: RapierRigidBody | null) => void;
 }
 
@@ -89,6 +92,7 @@ const LotteryBallBody = React.memo(function LotteryBallBody({
   radius,
   texture,
   envIntensity,
+  isLight,
   registerBody,
 }: LotteryBallBodyProps) {
   const handleRef = React.useCallback(
@@ -116,17 +120,25 @@ const LotteryBallBody = React.memo(function LotteryBallBody({
       ccd
     >
       <BallCollider key={`col-${radius}`} args={[radius]} />
-      <mesh castShadow receiveShadow>
-        <sphereGeometry args={[radius, 24, 18]} />
-        <meshPhysicalMaterial
-          map={texture}
-          roughness={0.09}
-          metalness={0.08}
-          clearcoat={1.0}
-          clearcoatRoughness={0.06}
-          reflectivity={0.95}
-          envMapIntensity={envIntensity}
-        />
+      <mesh castShadow={!isLight} receiveShadow={!isLight}>
+        <sphereGeometry args={[radius, isLight ? 14 : 24, isLight ? 10 : 18]} />
+        {isLight ? (
+          <meshStandardMaterial
+            map={texture}
+            roughness={0.24}
+            metalness={0.1}
+          />
+        ) : (
+          <meshPhysicalMaterial
+            map={texture}
+            roughness={0.09}
+            metalness={0.08}
+            clearcoat={1.0}
+            clearcoatRoughness={0.06}
+            reflectivity={0.95}
+            envMapIntensity={envIntensity}
+          />
+        )}
       </mesh>
     </RigidBody>
   );
@@ -137,6 +149,7 @@ export function LotteryCageAndBalls({
   isSpinBoost,
   digits,
   activeRevealTicketDigits,
+  themeSpec,
   revealTimelineRef,
 }: LotteryCageAndBallsProps) {
   const cageBodyRef = React.useRef<RapierRigidBody | null>(null);
@@ -152,8 +165,9 @@ export function LotteryCageAndBalls({
   const chutePosVecRef = React.useRef(new THREE.Vector3());
   const lastBallTexDigitRef = React.useRef<number>(-1);
 
-  const ballCount = quality === 'high' ? 50 : 40;
-  const ballRadius = quality === 'high' ? 0.188 : 0.198;
+  const isLight = quality === 'light';
+  const ballCount = quality === 'high' ? 50 : quality === 'medium' ? 40 : 24;
+  const ballRadius = quality === 'high' ? 0.188 : quality === 'medium' ? 0.198 : 0.21;
   const ballEnvIntensity = quality === 'high' ? 1.35 : 1.05;
 
   // Bake 10 crisp stained-glass jewel digit textures once and dispose cleanly
@@ -324,9 +338,9 @@ export function LotteryCageAndBalls({
       {/* Ornate Altar Pedestal & Gold Cradle Supports */}
       <group position={[0, -1.65, 0]}>
         {/* Lower obsidian marble plinth */}
-        <mesh position={[0, 0.14, 0]} receiveShadow castShadow>
+        <mesh position={[0, 0.14, 0]} receiveShadow castShadow={!isLight}>
           <cylinderGeometry args={[2.05, 2.28, 0.28, 8]} />
-          <meshStandardMaterial color="#10152F" roughness={0.35} metalness={0.4} />
+          <meshStandardMaterial color={themeSpec.pedestalMarbleColor} roughness={0.35} metalness={0.4} />
         </mesh>
         {/* Gold bevel ring */}
         <mesh position={[0, 0.3, 0]} receiveShadow>
@@ -334,9 +348,9 @@ export function LotteryCageAndBalls({
           <meshStandardMaterial color="#D4A13A" metalness={0.9} roughness={0.22} />
         </mesh>
         {/* Central sanctuary pedestal column */}
-        <mesh position={[0, 0.74, 0]} castShadow receiveShadow>
+        <mesh position={[0, 0.74, 0]} castShadow={!isLight} receiveShadow>
           <cylinderGeometry args={[1.1, 1.48, 0.84, 12]} />
-          <meshStandardMaterial color="#181236" roughness={0.42} metalness={0.32} />
+          <meshStandardMaterial color={themeSpec.pedestalColumnColor} roughness={0.42} metalness={0.32} />
         </mesh>
         {/* Upper gold altar collar */}
         <mesh position={[0, 1.19, 0]} castShadow>
@@ -441,33 +455,44 @@ export function LotteryCageAndBalls({
       <group ref={visualCageRef} position={CAGE_CENTER}>
         {/* Crystal-Clear Thin Glass Dome (zero transmission FBO blur or pixelation) */}
         <mesh>
-          <sphereGeometry args={[CAGE_RADIUS + 0.03, 48, 36]} />
-          <meshPhysicalMaterial
-            color="#E8F1FF"
-            transparent
-            opacity={quality === 'high' ? 0.14 : 0.17}
-            roughness={0.04}
-            metalness={0.04}
-            clearcoat={1.0}
-            clearcoatRoughness={0.03}
-            ior={1.5}
-            reflectivity={1.0}
-            envMapIntensity={quality === 'high' ? 1.65 : 1.0}
-            depthWrite={false}
-          />
+          <sphereGeometry args={[CAGE_RADIUS + 0.03, isLight ? 28 : 48, isLight ? 20 : 36]} />
+          {isLight ? (
+            <meshStandardMaterial
+              color="#E8F1FF"
+              transparent
+              opacity={0.14}
+              roughness={0.15}
+              metalness={0.15}
+              depthWrite={false}
+            />
+          ) : (
+            <meshPhysicalMaterial
+              color="#E8F1FF"
+              transparent
+              opacity={quality === 'high' ? 0.14 : 0.17}
+              roughness={0.04}
+              metalness={0.04}
+              clearcoat={1.0}
+              clearcoatRoughness={0.03}
+              ior={1.5}
+              reflectivity={1.0}
+              envMapIntensity={quality === 'high' ? 1.65 : 1.0}
+              depthWrite={false}
+            />
+          )}
         </mesh>
 
         {/* Ornate Gold Meridian & Equatorial Rings */}
         <mesh>
-          <torusGeometry args={[CAGE_RADIUS + 0.045, 0.045, 16, 64]} />
+          <torusGeometry args={[CAGE_RADIUS + 0.045, 0.045, isLight ? 10 : 16, isLight ? 40 : 64]} />
           <meshStandardMaterial color="#F5C451" metalness={0.92} roughness={0.18} />
         </mesh>
         <mesh rotation={[Math.PI / 2, 0, 0]}>
-          <torusGeometry args={[CAGE_RADIUS + 0.045, 0.042, 16, 64]} />
+          <torusGeometry args={[CAGE_RADIUS + 0.045, 0.042, isLight ? 10 : 16, isLight ? 40 : 64]} />
           <meshStandardMaterial color="#E5B94C" metalness={0.9} roughness={0.2} />
         </mesh>
         <mesh rotation={[0, Math.PI / 2, 0]}>
-          <torusGeometry args={[CAGE_RADIUS + 0.045, 0.038, 14, 64]} />
+          <torusGeometry args={[CAGE_RADIUS + 0.045, 0.038, isLight ? 8 : 14, isLight ? 40 : 64]} />
           <meshStandardMaterial color="#D4A13A" metalness={0.9} roughness={0.22} />
         </mesh>
 
@@ -490,7 +515,7 @@ export function LotteryCageAndBalls({
         </mesh>
       </group>
 
-      {/* 40-50 Dynamic Glossy Stained-Glass Jewel Balls (0-9 via CanvasTexture) */}
+      {/* 24-50 Dynamic Glossy Stained-Glass Jewel Balls (0-9 via CanvasTexture) */}
       {ballConfigs.map((ball) => (
         <LotteryBallBody
           key={ball.id}
@@ -499,6 +524,7 @@ export function LotteryCageAndBalls({
           radius={ballRadius}
           texture={digitTextures[ball.digit]}
           envIntensity={ballEnvIntensity}
+          isLight={isLight}
           registerBody={registerBallBody}
         />
       ))}

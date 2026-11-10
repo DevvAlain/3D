@@ -26,8 +26,12 @@ describe('Event Schemas', () => {
     is_active: true,
   };
 
-  it('validates a correct event payload', () => {
-    const result = EventSchema.safeParse(validEvent);
+  it('validates a correct event payload including PostgREST +00:00 TIMESTAMPTZ offsets', () => {
+    const result = EventSchema.safeParse({
+      ...validEvent,
+      created_at: '2026-11-10T14:24:00.892341+00:00',
+      updated_at: '2026-11-10T14:25:12.123456+00:00',
+    });
     expect(result.success).toBe(true);
   });
 

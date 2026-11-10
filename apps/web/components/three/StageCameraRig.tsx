@@ -4,6 +4,12 @@ import * as React from 'react';
 import * as THREE from 'three';
 import { useFrame, useThree } from '@react-three/fiber';
 import type { RevealTimelineSnapshot } from '@/lib/reveal-timeline';
+import {
+  createInitialFpsDowngradeState,
+  stepFpsDowngradeState,
+  type DisplayQualityPreset,
+  type FpsDowngradeState,
+} from '@/lib/quality-monitor';
 
 export interface CameraFitTarget {
   z: number;
@@ -35,27 +41,37 @@ export function computeStageCameraFit(params: {
 
 interface StageCameraRigProps {
   digits: number;
-  measureFps: boolean;
+  quality: DisplayQualityPreset;
   onFpsSample: (fps: number) => void;
+  onAutoDowngradeQuality?: (measuredFps: number) => void;
   revealTimelineRef: React.MutableRefObject<RevealTimelineSnapshot>;
 }
 
 export function StageCameraRig({
   digits,
-  measureFps,
+  quality,
   onFpsSample,
+  onAutoDowngradeQuality,
   revealTimelineRef,
 }: StageCameraRigProps) {
   const { camera, size } = useThree();
   const lookAtTarget = React.useMemo(() => new THREE.Vector3(0, 0.24, 0.25), []);
   const frameCountRef = React.useRef(0);
   const accumTimeRef = React.useRef(0);
+  const downgradeStateRef = React.useRef<FpsDowngradeState>(createInitialFpsDowngradeState());
 
   const aspect = size.height > 0 ? size.width / size.height : 16 / 9;
   const fit = React.useMemo(
     () => computeStageCameraFit({ digits, aspect }),
     [digits, aspect]
   );
+
+  // Give the newly selected quality tier a brief settling warmup before checking auto-downgrade
+  React.useEffect(() => {
+    downgradeStateRef.current = createInitialFpsDowngradeState();
+    frameCountRef.current = 0;
+    accumTimeRef.current = 0;
+  }, [quality]);
 
   React.useEffect(() => {
     if (camera instanceof THREE.PerspectiveCamera && Math.abs(camera.fov - fit.fov) > 0.1) {
@@ -82,12 +98,25 @@ export function StageCameraRig({
     camera.position.z = THREE.MathUtils.lerp(camera.position.z, targetZ, damp);
     camera.lookAt(lookAtTarget);
 
-    if (measureFps && delta > 0) {
+    // Always sample FPS silently so sustained <40 FPS triggers automatic downgrade cleanly
+    if (delta > 0 && delta < 0.25) {
       frameCountRef.current += 1;
       accumTimeRef.current += delta;
       if (accumTimeRef.current >= 0.45) {
-        const avgFps = Math.round(frameCountRef.current / accumTimeRef.current);
+        const windowSec = accumTimeRef.current;
+        const avgFps = Math.round(frameCountRef.current / windowSec);
         onFpsSample(avgFps);
+
+        const step = stepFpsDowngradeState(downgradeStateRef.current, {
+          fps: avgFps,
+          windowSec,
+          isHidden: typeof document !== 'undefined' ? document.hidden : false,
+        });
+        downgradeStateRef.current = step.nextState;
+        if (step.shouldDowngrade && onAutoDowngradeQuality) {
+          onAutoDowngradeQuality(step.measuredFps);
+        }
+
         frameCountRef.current = 0;
         accumTimeRef.current = 0;
       }

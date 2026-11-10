@@ -5,7 +5,7 @@ export const ExcludedTicketSchema = z.object({
   event_id: z.string().uuid('ID sự kiện không hợp lệ'),
   ticket: z.number().int('Số vé phải là số nguyên').min(0, 'Số vé không được âm'),
   reason: z.string().trim().max(250, 'Lý do tối đa 250 ký tự').nullable().optional(),
-  created_at: z.string().datetime().optional(),
+  created_at: z.string().datetime({ offset: true }).optional(),
 });
 export type ExcludedTicket = z.infer<typeof ExcludedTicketSchema>;
 

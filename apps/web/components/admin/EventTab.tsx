@@ -87,6 +87,7 @@ export function EventTab({ event, hasRealDraws, onRefresh, onFeedback }: EventTa
         onFeedback('error', json.error || 'Không thể kích hoạt sự kiện.');
         return;
       }
+      setIsActive(true);
       onFeedback('success', `Đã kích hoạt sự kiện "${event.title}" cho màn hình Display.`);
       await onRefresh(event.id);
     } catch {
@@ -172,8 +173,8 @@ export function EventTab({ event, hasRealDraws, onRefresh, onFeedback }: EventTa
                   className="flex h-10 w-full rounded-lg border border-parish-gold/25 bg-parish-navy/90 px-3 py-2 text-sm text-parish-cream focus:outline-none focus:ring-2 focus:ring-parish-gold/60"
                 >
                   <option value="classic">Cổ Điển (Kính màu Vàng - Xanh Đêm)</option>
-                  <option value="christmas">Giáng Sinh (Đỏ Rượu - Ánh Vàng)</option>
-                  <option value="easter">Phục Sinh (Trắng Kem - Ánh Sáng)</option>
+                  <option value="christmas">Giáng Sinh (Đỏ Rượu - Lục Thông - Tuyết rơi)</option>
+                  <option value="easter">Phục Sinh (Ánh Sáng Tím Vàng - Cánh hoa bay)</option>
                 </select>
               </div>
 
@@ -267,7 +268,7 @@ export function EventTab({ event, hasRealDraws, onRefresh, onFeedback }: EventTa
             </div>
 
             <div className="flex justify-end">
-              <Button type="submit" disabled={saving}>
+              <Button type="submit" disabled={saving || activating}>
                 <Save className="h-4 w-4" />
                 {saving ? 'Đang lưu...' : 'Lưu thay đổi sự kiện'}
               </Button>

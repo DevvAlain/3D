@@ -56,34 +56,38 @@ BEGIN
             (v_event_id, 2500, 'Vé in lỗi mã vạch');
 
         -- 3. Insert Prizes (Drawn from lowest to highest: Ba -> Nhì -> Nhất -> Đặc Biệt)
-        INSERT INTO public.prizes (event_id, name, reward, quantity, sort_order) VALUES
+        INSERT INTO public.prizes (event_id, name, reward, quantity, sort_order, speed_mode) VALUES
             (
                 v_event_id,
                 'Giải Ba',
                 'Nồi chiên không dầu Philips 5.6L',
                 10,
-                1
+                1,
+                'fast'
             ),
             (
                 v_event_id,
                 'Giải Nhì',
                 'Tủ lạnh Inverter Panasonic 300L',
                 5,
-                2
+                2,
+                'fast'
             ),
             (
                 v_event_id,
                 'Giải Nhất',
                 'Xe máy Honda Vision 2026 Smartkey',
                 3,
-                3
+                3,
+                'full'
             ),
             (
                 v_event_id,
                 'Giải Đặc Biệt',
                 'Xe máy Honda SH 150i ABS 2026',
                 1,
-                4
+                4,
+                'full'
             );
     END IF;
 END $$;

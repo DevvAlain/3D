@@ -123,6 +123,7 @@ export async function POST(req: Request) {
           reward: p.reward,
           quantity: p.quantity,
           sort_order: p.sort_order,
+          ...(p.speed_mode ? { speed_mode: p.speed_mode } : {}),
         }));
         const { error: prizeErr } = await admin.from('prizes').insert(prizeRows);
         if (prizeErr) return rpcErrorResponse(prizeErr);
@@ -182,6 +183,7 @@ export async function POST(req: Request) {
           reward: p.reward,
           quantity: p.quantity,
           sort_order: p.sort_order,
+          ...(p.speed_mode ? { speed_mode: p.speed_mode } : {}),
         }));
         const { error: prizeErr } = await admin.from('prizes').insert(prizeRows);
         if (prizeErr) throw prizeErr;

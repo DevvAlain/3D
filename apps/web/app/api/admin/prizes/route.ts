@@ -6,6 +6,15 @@ import { createAdminSupabaseClient } from '@/lib/supabase/admin';
 import { enforceApiRateLimit } from '@/lib/rate-limit';
 import { rpcErrorResponse } from '@/lib/rpc-errors';
 
+function isMissingSpeedModeColumnError(error: { code?: string; message?: string } | null | undefined): boolean {
+  if (!error) return false;
+  return (
+    (error.code === '42703' || error.code === 'PGRST204') &&
+    typeof error.message === 'string' &&
+    error.message.includes('speed_mode')
+  );
+}
+
 export async function POST(req: Request) {
   const auth = await requireApiRole(['admin']);
   if (!auth.ok) return auth.response;
@@ -24,11 +33,23 @@ export async function POST(req: Request) {
     }
 
     const admin = createAdminSupabaseClient();
-    const { data, error } = await admin
+    let { data, error } = await admin
       .from('prizes')
       .insert(parsed.data)
       .select('*')
       .single<Prize>();
+
+    if (isMissingSpeedModeColumnError(error)) {
+      const legacyPayload = { ...parsed.data };
+      delete legacyPayload.speed_mode;
+      const retry = await admin
+        .from('prizes')
+        .insert(legacyPayload)
+        .select('*')
+        .single<Prize>();
+      data = retry.data;
+      error = retry.error;
+    }
 
     if (error) return rpcErrorResponse(error);
     return NextResponse.json({ prize: data }, { status: 201 });
@@ -90,12 +111,25 @@ export async function PATCH(req: Request) {
     }
 
     const { id, ...updates } = singleParsed.data;
-    const { data, error } = await admin
+    let { data, error } = await admin
       .from('prizes')
       .update({ ...updates, updated_at: new Date().toISOString() })
       .eq('id', id)
       .select('*')
       .single<Prize>();
+
+    if (isMissingSpeedModeColumnError(error)) {
+      const legacyUpdates = { ...updates };
+      delete legacyUpdates.speed_mode;
+      const retry = await admin
+        .from('prizes')
+        .update({ ...legacyUpdates, updated_at: new Date().toISOString() })
+        .eq('id', id)
+        .select('*')
+        .single<Prize>();
+      data = retry.data;
+      error = retry.error;
+    }
 
     if (error) return rpcErrorResponse(error);
     return NextResponse.json({ prize: data });

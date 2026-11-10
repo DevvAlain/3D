@@ -33,3 +33,25 @@ body {
 .parish-credits-viewport:hover .parish-credits-track {
   animation-play-state: paused;
 }
+
+@keyframes parishFallDrift {
+  0% {
+    transform: translate3d(0, -8vh, 0) rotate(0deg);
+    opacity: 0;
+  }
+  12% {
+    opacity: 0.85;
+  }
+  88% {
+    opacity: 0.85;
+  }
+  100% {
+    transform: translate3d(34px, 106vh, 0) rotate(220deg);
+    opacity: 0;
+  }
+}
+
+.parish-2d-particle {
+  animation: parishFallDrift var(--fall-duration, 9s) linear infinite;
+  will-change: transform, opacity;
+}

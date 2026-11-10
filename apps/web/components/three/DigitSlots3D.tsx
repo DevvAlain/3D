@@ -14,12 +14,14 @@ import {
   computeDigitSlotLayout,
   DIGIT_SLOTS_ANCHOR,
 } from '@/components/three/stage-layout';
+import type { StageThemeSpec } from '@/components/three/stage-themes';
 
 interface DigitSlots3DProps {
   digits: number;
   currentTicket: number | null;
   revealedDigits: number;
   isFinalReveal: boolean;
+  themeSpec: StageThemeSpec;
   revealTimelineRef: React.MutableRefObject<RevealTimelineSnapshot>;
 }
 
@@ -28,6 +30,7 @@ export function DigitSlots3D({
   currentTicket,
   revealedDigits,
   isFinalReveal,
+  themeSpec,
   revealTimelineRef,
 }: DigitSlots3DProps) {
   const { safeDigits, spacing, plaqueW, plaqueH, totalSpan, lecternWidth } =
@@ -161,7 +164,7 @@ export function DigitSlots3D({
       {/* Dark Royal Lectern Base resting solidly on floor */}
       <mesh position={[0, -plaqueH / 2 - 0.14, 0]} receiveShadow castShadow>
         <boxGeometry args={[lecternWidth, 0.22, 0.44]} />
-        <meshStandardMaterial color="#12183A" roughness={0.35} metalness={0.45} />
+        <meshStandardMaterial color={themeSpec.lecternBaseColor} roughness={0.35} metalness={0.45} />
       </mesh>
       {/* Brushed Gold Trim Molding */}
       <mesh position={[0, -plaqueH / 2 - 0.01, 0]}>

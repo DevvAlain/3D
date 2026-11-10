@@ -5,6 +5,7 @@ import dynamic from 'next/dynamic';
 import type { DisplayStatePayload } from '@church/shared';
 import { useDisplayController } from '@/hooks/useDisplayController';
 import { DisplayStage2D } from '@/components/display/DisplayStage2D';
+import { ServiceWorkerRegistrar } from '@/components/display/ServiceWorkerRegistrar';
 
 const DisplayStage3D = dynamic(
   () => import('@/components/three/DisplayStage3D').then((m) => m.DisplayStage3D),
@@ -37,9 +38,14 @@ export function DisplayViewport({
     actorEmail,
   });
 
-  if (!controller.shouldRender3D) {
-    return <DisplayStage2D controller={controller} />;
-  }
-
-  return <DisplayStage3D controller={controller} />;
+  return (
+    <>
+      <ServiceWorkerRegistrar />
+      {!controller.shouldRender3D ? (
+        <DisplayStage2D controller={controller} />
+      ) : (
+        <DisplayStage3D controller={controller} />
+      )}
+    </>
+  );
 }

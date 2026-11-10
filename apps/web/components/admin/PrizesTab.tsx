@@ -1,7 +1,22 @@
 'use client';
 
 import * as React from 'react';
-import { ArrowDown, ArrowUp, GripVertical, Lock, Plus, Save, Trash2 } from 'lucide-react';
+import {
+  ArrowDown,
+  ArrowUp,
+  Gauge,
+  GripVertical,
+  Lock,
+  Plus,
+  Save,
+  Sparkles,
+  Trash2,
+} from 'lucide-react';
+import {
+  resolvePrizeSpeedMode,
+  suggestDefaultSpeedModeForNewPrize,
+  type PrizeSpeedMode,
+} from '@church/shared';
 import type { AdminPrizeWithStats } from '@/lib/admin-types';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -16,23 +31,46 @@ interface PrizesTabProps {
   onFeedback: (type: 'success' | 'error', msg: string) => void;
 }
 
+const SPEED_LABELS: Record<PrizeSpeedMode, string> = {
+  fast: 'Nhanh (~8s)',
+  full: 'Đầy đủ (~17s)',
+};
+
 export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabProps) {
   const [orderedPrizes, setOrderedPrizes] = React.useState<AdminPrizeWithStats[]>(prizes);
   const [name, setName] = React.useState('');
   const [reward, setReward] = React.useState('');
   const [quantity, setQuantity] = React.useState(1);
+  const [speedMode, setSpeedMode] = React.useState<PrizeSpeedMode>('fast');
+  const [speedTouched, setSpeedTouched] = React.useState(false);
   const [creating, setCreating] = React.useState(false);
 
   const [editingId, setEditingId] = React.useState<string | null>(null);
   const [editName, setEditName] = React.useState('');
   const [editReward, setEditReward] = React.useState('');
   const [editQty, setEditQty] = React.useState(1);
+  const [editSpeedMode, setEditSpeedMode] = React.useState<PrizeSpeedMode>('fast');
   const [busyId, setBusyId] = React.useState<string | null>(null);
   const [dragIndex, setDragIndex] = React.useState<number | null>(null);
 
   React.useEffect(() => {
     setOrderedPrizes(prizes);
   }, [prizes]);
+
+  // Smart default for new prizes unless operator manually overrides:
+  // top prizes (Đặc Biệt / Nhất / single highest tier) default to 'full', small ones default to 'fast'
+  React.useEffect(() => {
+    if (speedTouched) return;
+    const nextSort =
+      orderedPrizes.length > 0 ? Math.max(...orderedPrizes.map((p) => p.sort_order)) + 1 : 0;
+    const suggested = suggestDefaultSpeedModeForNewPrize({
+      name,
+      quantity: Number(quantity) || 1,
+      sortOrder: nextSort,
+      existingPrizes: orderedPrizes,
+    });
+    setSpeedMode(suggested);
+  }, [name, quantity, orderedPrizes, speedTouched]);
 
   async function handleCreatePrize(e: React.FormEvent) {
     e.preventDefault();
@@ -50,6 +88,7 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
           reward: reward.trim(),
           quantity: Number(quantity),
           sort_order: nextSortOrder,
+          speed_mode: speedMode,
         }),
       });
       const json = await res.json();
@@ -60,7 +99,8 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
       setName('');
       setReward('');
       setQuantity(1);
-      onFeedback('success', 'Đã thêm giải thưởng mới.');
+      setSpeedTouched(false);
+      onFeedback('success', `Đã thêm giải thưởng mới (${SPEED_LABELS[speedMode]}).`);
       await onRefresh(eventId);
     } catch {
       onFeedback('error', 'Lỗi kết nối khi thêm giải thưởng.');
@@ -74,6 +114,7 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
     setEditName(prize.name);
     setEditReward(prize.reward);
     setEditQty(prize.quantity);
+    setEditSpeedMode(resolvePrizeSpeedMode(prize, orderedPrizes));
   }
 
   async function handleSaveEdit(prize: AdminPrizeWithStats) {
@@ -88,6 +129,7 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
           name: editName.trim(),
           reward: editReward.trim(),
           quantity: Number(editQty),
+          speed_mode: editSpeedMode,
         }),
       });
       const json = await res.json();
@@ -96,10 +138,41 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
         return;
       }
       setEditingId(null);
-      onFeedback('success', 'Đã cập nhật thông tin giải thưởng.');
+      onFeedback('success', 'Đã cập nhật thông tin & tốc độ giải thưởng.');
       await onRefresh(eventId);
     } catch {
       onFeedback('error', 'Lỗi kết nối khi cập nhật giải thưởng.');
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleToggleSpeedMode(prize: AdminPrizeWithStats) {
+    if (!prize.id) return;
+    const current = resolvePrizeSpeedMode(prize, orderedPrizes);
+    const nextSpeed: PrizeSpeedMode = current === 'full' ? 'fast' : 'full';
+    setBusyId(prize.id);
+    try {
+      const res = await fetch('/api/admin/prizes', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          id: prize.id,
+          speed_mode: nextSpeed,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) {
+        onFeedback('error', json.error || 'Không thể đổi tốc độ quay của giải thưởng.');
+        return;
+      }
+      onFeedback(
+        'success',
+        `Đã chuyển "${prize.name}" sang chế độ quay ${SPEED_LABELS[nextSpeed]}.`
+      );
+      await onRefresh(eventId);
+    } catch {
+      onFeedback('error', 'Lỗi kết nối khi cập nhật tốc độ quay.');
     } finally {
       setBusyId(null);
     }
@@ -166,7 +239,7 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
         <CardHeader>
           <CardTitle>Thêm Giải Thưởng Mới</CardTitle>
           <CardDescription>
-            Thứ tự từ trên xuống dưới là thứ tự sân khấu sẽ tự động quay lần lượt. Thường xếp giải nhỏ trước, giải Đặc Biệt sau cùng.
+            Thứ tự từ trên xuống dưới là thứ tự sân khấu sẽ tự động quay lần lượt. Thường xếp giải nhỏ trước (Nhanh ~8s), giải Đặc Biệt / Nhất sau cùng (Đầy đủ ~17s).
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -191,17 +264,37 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
                 onChange={(e) => setReward(e.target.value)}
               />
             </div>
-            <div className="space-y-2">
-              <Label htmlFor="pz-qty">Số lượng giải</Label>
-              <Input
-                id="pz-qty"
-                type="number"
-                required
-                min={1}
-                value={quantity}
-                onChange={(e) => setQuantity(Number(e.target.value))}
-              />
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-2">
+                <Label htmlFor="pz-qty">Số lượng giải</Label>
+                <Input
+                  id="pz-qty"
+                  type="number"
+                  required
+                  min={1}
+                  value={quantity}
+                  onChange={(e) => setQuantity(Number(e.target.value))}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="pz-speed">Tốc độ quay số</Label>
+                <select
+                  id="pz-speed"
+                  value={speedMode}
+                  onChange={(e) => {
+                    setSpeedMode(e.target.value as PrizeSpeedMode);
+                    setSpeedTouched(true);
+                  }}
+                  className="flex h-10 w-full rounded-lg border border-parish-gold/25 bg-parish-navy/90 px-3 py-2 text-sm text-parish-cream focus:outline-none focus:ring-2 focus:ring-parish-gold/60"
+                >
+                  <option value="fast">Nhanh (~8s)</option>
+                  <option value="full">Đầy đủ (~17s)</option>
+                </select>
+              </div>
             </div>
+            <p className="text-[11px] text-parish-cream/60">
+              Mặc định gợi ý: giải lớn (Đặc Biệt, Nhất) chạy <strong>Đầy đủ (~17s)</strong> hồi hộp; giải nhỏ nhiều lượt chạy <strong>Nhanh (~8s)</strong>. Trên sân khấu vẫn luôn bấm <kbd className="rounded bg-white/10 px-1">Space</kbd> để mở ngay.
+            </p>
             <Button type="submit" className="w-full" disabled={creating}>
               <Plus className="h-4 w-4" />
               {creating ? 'Đang thêm...' : 'Thêm giải thưởng'}
@@ -214,7 +307,7 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
         <CardHeader>
           <CardTitle>Cơ Cấu Giải Thưởng ({orderedPrizes.length} hạng mục)</CardTitle>
           <CardDescription>
-            Kéo thả hoặc nhấn nút mũi tên để thay đổi thứ tự quay. Nếu giải đã có lượt quay, không thể xóa và không thể giảm số lượng xuống thấp hơn số lượt đã quay.
+            Kéo thả hoặc nhấn nút mũi tên để thay đổi thứ tự quay. Bấm vào nhãn tốc độ để chuyển đổi nhanh giữa &ldquo;Nhanh (~8s)&rdquo; và &ldquo;Đầy đủ (~17s)&rdquo;.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -227,6 +320,7 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
               {orderedPrizes.map((prize, idx) => {
                 const isEditing = editingId === prize.id;
                 const lockedDelete = prize.total_draws_count > 0;
+                const effectiveSpeed = resolvePrizeSpeedMode(prize, orderedPrizes);
                 return (
                   <div
                     key={prize.id ?? idx}
@@ -242,7 +336,7 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
                     className="rounded-xl border border-parish-gold/25 bg-parish-navy/60 p-4 transition-colors hover:border-parish-gold/50"
                   >
                     {isEditing ? (
-                      <div className="grid gap-3 sm:grid-cols-4">
+                      <div className="grid gap-3 sm:grid-cols-5">
                         <Input
                           value={editName}
                           onChange={(e) => setEditName(e.target.value)}
@@ -266,6 +360,15 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
                             </p>
                           ) : null}
                         </div>
+                        <select
+                          aria-label="Tốc độ quay giải thưởng"
+                          value={editSpeedMode}
+                          onChange={(e) => setEditSpeedMode(e.target.value as PrizeSpeedMode)}
+                          className="h-10 w-full rounded-lg border border-parish-gold/25 bg-parish-navy/90 px-2.5 text-xs text-parish-cream"
+                        >
+                          <option value="fast">Nhanh (~8s)</option>
+                          <option value="full">Đầy đủ (~17s)</option>
+                        </select>
                         <div className="flex items-center justify-end gap-2">
                           <Button
                             size="sm"
@@ -287,7 +390,27 @@ export function PrizesTab({ eventId, prizes, onRefresh, onFeedback }: PrizesTabP
                             <div className="flex flex-wrap items-center gap-2">
                               <span className="text-xs font-bold text-parish-gold">#{idx + 1}</span>
                               <span className="font-semibold text-parish-cream">{prize.name}</span>
-                              <Badge variant="default">{prize.won_mode_count}/{prize.quantity} đã trao</Badge>
+                              <Badge variant="default">
+                                {prize.won_mode_count}/{prize.quantity} đã trao
+                              </Badge>
+                              <button
+                                type="button"
+                                disabled={busyId === prize.id}
+                                onClick={() => void handleToggleSpeedMode(prize)}
+                                title="Bấm để chuyển giữa Nhanh (~8s) và Đầy đủ (~17s)"
+                                className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-0.5 text-[11px] font-semibold transition-colors ${
+                                  effectiveSpeed === 'full'
+                                    ? 'border-parish-gold/55 bg-parish-gold/15 text-parish-goldLight hover:bg-parish-gold/25'
+                                    : 'border-emerald-400/40 bg-emerald-500/15 text-emerald-200 hover:bg-emerald-500/25'
+                                }`}
+                              >
+                                {effectiveSpeed === 'full' ? (
+                                  <Sparkles className="h-3 w-3" />
+                                ) : (
+                                  <Gauge className="h-3 w-3" />
+                                )}
+                                {SPEED_LABELS[effectiveSpeed]}
+                              </button>
                               {lockedDelete ? (
                                 <Badge variant="muted">
                                   <Lock className="h-3 w-3" /> Đã phát sinh quay ({prize.total_draws_count})

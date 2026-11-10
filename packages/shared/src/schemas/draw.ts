@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { PrizeSchema } from './prize';
+import { PrizeSchema, PrizeSpeedModeSchema } from './prize';
 import { EventSchema } from './event';
 
 export const DrawStatusSchema = z.enum(['revealing', 'won', 'absent', 'void']);
@@ -14,8 +14,8 @@ export const DrawSchema = z.object({
   seq: z.number().int().min(1, 'Thứ tự lượt quay phải bắt đầu từ 1'),
   idempotency_key: z.string().nullable().optional(),
   is_test: z.boolean().default(false),
-  created_at: z.string().datetime(),
-  updated_at: z.string().datetime(),
+  created_at: z.string().datetime({ offset: true }),
+  updated_at: z.string().datetime({ offset: true }),
   prize: PrizeSchema.optional(),
 });
 export type Draw = z.infer<typeof DrawSchema>;
@@ -76,7 +76,7 @@ export const AuditLogSchema = z.object({
   actor_email: z.string().nullable(),
   action: z.string(),
   details: z.record(z.unknown()),
-  created_at: z.string().datetime(),
+  created_at: z.string().datetime({ offset: true }),
 });
 export type AuditLog = z.infer<typeof AuditLogSchema>;
 
@@ -122,6 +122,7 @@ export const EventConfigImportSchema = z
           reward: z.string().trim().min(1).max(200),
           quantity: z.number().int().min(1),
           sort_order: z.number().int().min(0),
+          speed_mode: PrizeSpeedModeSchema.nullable().optional(),
         })
       )
       .default([]),

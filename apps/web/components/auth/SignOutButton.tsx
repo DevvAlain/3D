@@ -17,6 +17,14 @@ export function SignOutButton({ label = 'Đăng xuất', variant = 'outline', si
   async function handleSignOut() {
     setLoading(true);
     try {
+      if (typeof window !== 'undefined') {
+        if ('caches' in window) {
+          void caches.delete('church-display-doc-v1').catch(() => undefined);
+        }
+        if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+          navigator.serviceWorker.controller.postMessage({ type: 'CLEAR_DOC_CACHE' });
+        }
+      }
       const supabase = createBrowserSupabaseClient();
       await supabase.auth.signOut();
       router.refresh();

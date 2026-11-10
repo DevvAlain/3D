@@ -22,8 +22,8 @@ export const EventBaseSchema = z.object({
   test_mode: z.boolean().default(false),
   status: EventStatusSchema.default('draft'),
   is_active: z.boolean().default(false),
-  created_at: z.string().datetime().optional(),
-  updated_at: z.string().datetime().optional(),
+  created_at: z.string().datetime({ offset: true }).optional(),
+  updated_at: z.string().datetime({ offset: true }).optional(),
 });
 
 export const EventSchema = EventBaseSchema.superRefine((data, ctx) => {

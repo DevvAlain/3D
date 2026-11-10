@@ -1,10 +1,12 @@
 'use client';
 
 import * as React from 'react';
+import Link from 'next/link';
 import {
   AlertTriangle,
   BarChart3,
   Calendar,
+  ClipboardCheck,
   ExternalLink,
   Gift,
   Lock,
@@ -33,6 +35,7 @@ import { TicketsTab } from './TicketsTab';
 import { PrizesTab } from './PrizesTab';
 import { LiveResultsTab } from './LiveResultsTab';
 import { DangerAndPreviewTab } from './DangerAndPreviewTab';
+import { RehearsalChecklist } from './RehearsalChecklist';
 
 interface AdminDashboardProps {
   userEmail: string;
@@ -186,6 +189,19 @@ export function AdminDashboard({ userEmail }: AdminDashboardProps) {
               <Plus className="h-4 w-4" /> Sự kiện mới
             </Button>
 
+            <Link
+              href={
+                selectedEvent?.id
+                  ? `/admin/checklist?event_id=${encodeURIComponent(selectedEvent.id)}`
+                  : '/admin/checklist'
+              }
+            >
+              <Button variant="outline" size="sm" data-testid="nav-checklist-link">
+                <ClipboardCheck className="h-4 w-4 text-parish-gold" />
+                Kiểm tra trước sự kiện
+              </Button>
+            </Link>
+
             <a href="/display?preview=1" target="_blank" rel="noreferrer">
               <Button variant="outline" size="sm">
                 <ExternalLink className="h-4 w-4" /> Preview
@@ -277,6 +293,9 @@ export function AdminDashboard({ userEmail }: AdminDashboardProps) {
                 <TabsTrigger value="results">
                   <BarChart3 className="h-4 w-4" /> Kết quả trực tiếp ({state?.draws.length ?? 0})
                 </TabsTrigger>
+                <TabsTrigger value="checklist" data-testid="tab-checklist">
+                  <ClipboardCheck className="h-4 w-4" /> Kiểm tra trước sự kiện
+                </TabsTrigger>
                 <TabsTrigger value="danger">
                   <ShieldAlert className="h-4 w-4" /> Xem trước & Vùng nguy hiểm
                 </TabsTrigger>
@@ -317,6 +336,14 @@ export function AdminDashboard({ userEmail }: AdminDashboardProps) {
                   prizes={state?.prizes ?? []}
                   draws={state?.draws ?? []}
                   realtimeConnected={realtimeConnected}
+                />
+              </TabsContent>
+
+              <TabsContent value="checklist">
+                <RehearsalChecklist
+                  eventId={selectedEvent.id}
+                  onEventChanged={() => loadState(selectedEvent.id)}
+                  onFeedback={showFeedback}
                 />
               </TabsContent>
 

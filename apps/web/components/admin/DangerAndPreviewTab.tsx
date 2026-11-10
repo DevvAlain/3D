@@ -127,6 +127,7 @@ export function DangerAndPreviewTab({
         reward: p.reward,
         quantity: p.quantity,
         sort_order: p.sort_order,
+        speed_mode: p.speed_mode ?? null,
       })),
       excluded_tickets: excludedTickets.map((t) => ({
         ticket: t.ticket,
@@ -141,6 +142,16 @@ export function DangerAndPreviewTab({
     link.download = `cau-hinh-su-kien-${new Date().toISOString().slice(0, 10)}.json`;
     link.click();
     URL.revokeObjectURL(url);
+    try {
+      if (event.id) {
+        window.localStorage.setItem(
+          `church_checklist_backup_${event.id}`,
+          new Date().toISOString()
+        );
+      }
+    } catch {
+      // Ignore storage errors
+    }
   }
 
   async function handleImportConfigFile(file: File | undefined, overwriteCurrent: boolean) {

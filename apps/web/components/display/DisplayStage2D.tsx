@@ -4,6 +4,7 @@ import * as React from 'react';
 import {
   CheckCircle2,
   FastForward,
+  Gauge,
   Play,
   Undo2,
   UserX,
@@ -29,6 +30,8 @@ export function DisplayStage2D({ controller }: DisplayStage2DProps) {
     isPreview,
     revealedDigits,
     isAnimating,
+    activeDrawSpeedMode,
+    currentPrizeSpeedMode,
     submittingAction,
     isInCooldown,
     skipRevealAnimation,
@@ -45,6 +48,7 @@ export function DisplayStage2D({ controller }: DisplayStage2DProps) {
   const latestDraw = state.latestDraw;
   const activePrize = state.activePrize;
   const controlsBusy = Boolean(submittingAction) || isInCooldown;
+  const displayedSpeedMode = currentDraw ? activeDrawSpeedMode : currentPrizeSpeedMode;
 
   const formattedTicket = currentDraw
     ? formatTicket(currentDraw.ticket, digits)
@@ -59,13 +63,19 @@ export function DisplayStage2D({ controller }: DisplayStage2DProps) {
         <section className="flex flex-col justify-between rounded-3xl border border-parish-gold/30 bg-parish-night/70 p-6 shadow-2xl backdrop-blur-md lg:col-span-8 sm:p-8">
           {/* Current Prize Header */}
           <div className="text-center">
-            <Badge variant="default" className="px-4 py-1 text-sm">
-              {currentDraw
-                ? `Lượt quay #${currentDraw.seq} • Đang mở thưởng`
-                : activePrize
-                  ? `Giải kế tiếp (${activePrize.won_count}/${activePrize.quantity} đã trao)`
-                  : 'Sẵn sàng'}
-            </Badge>
+            <div className="flex flex-wrap items-center justify-center gap-2">
+              <Badge variant="default" className="px-4 py-1 text-sm">
+                {currentDraw
+                  ? `Lượt quay #${currentDraw.seq} • Đang mở thưởng`
+                  : activePrize
+                    ? `Giải kế tiếp (${activePrize.won_count}/${activePrize.quantity} đã trao)`
+                    : 'Sẵn sàng'}
+              </Badge>
+              <span className="inline-flex items-center gap-1 rounded-full border border-parish-gold/40 bg-parish-gold/10 px-3 py-1 text-xs font-semibold text-parish-goldLight">
+                <Gauge className="h-3.5 w-3.5" />
+                {displayedSpeedMode === 'fast' ? 'Nhanh (~8s)' : 'Đầy đủ (~17s)'}
+              </span>
+            </div>
 
             <h2 className="mt-3 font-title text-3xl font-extrabold tracking-tight text-parish-goldLight sm:text-5xl">
               {currentDraw?.prize?.name ?? activePrize?.name ?? 'Đang chuẩn bị giải thưởng'}

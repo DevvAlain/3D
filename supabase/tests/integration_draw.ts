@@ -66,6 +66,10 @@ async function runIntegrationTests() {
     path.resolve(repoRoot, 'supabase/migrations/20261110000003_activate_event_rpc.sql'),
     'utf-8'
   );
+  const migration4 = fs.readFileSync(
+    path.resolve(repoRoot, 'supabase/migrations/20261110000004_prize_speed_mode.sql'),
+    'utf-8'
+  );
 
   const useLocalSupabase = await isLocalSupabaseRunning();
   let embeddedPg: EmbeddedPostgres | null = null;
@@ -143,6 +147,8 @@ async function runIntegrationTests() {
       await pool.query(migration2);
       console.log('[INIT] Applying migration 20261110000003_activate_event_rpc.sql...');
       await pool.query(migration3);
+      console.log('[INIT] Applying migration 20261110000004_prize_speed_mode.sql...');
+      await pool.query(migration4);
       console.log('✓ Migrations applied successfully.');
     }
 

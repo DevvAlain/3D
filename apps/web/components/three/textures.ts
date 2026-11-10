@@ -19,12 +19,25 @@ export const BALL_DIGIT_PALETTE: ReadonlyArray<{
   { base: '#B91C1C', highlight: '#EF4444', shadow: '#4F0808' }, // 9: Warm Vermilion
 ];
 
-/**
- * Generates an equirectangular stained-glass jewel ball CanvasTexture with rich
- * saturated colors, dual gold-trimmed medallions, and high-contrast digit glyphs.
- */
-export function createBallDigitTexture(digit: number): THREE.CanvasTexture {
+const ballCanvasCache = new Map<number, HTMLCanvasElement>();
+const slotCanvasCache = new Map<string, HTMLCanvasElement>();
+let goldDustCanvasCache: HTMLCanvasElement | null = null;
+let snowflakeCanvasCache: HTMLCanvasElement | null = null;
+let petalCanvasCache: HTMLCanvasElement | null = null;
+
+export function clearWarmTextureCaches(): void {
+  ballCanvasCache.clear();
+  slotCanvasCache.clear();
+  goldDustCanvasCache = null;
+  snowflakeCanvasCache = null;
+  petalCanvasCache = null;
+}
+
+function buildBallDigitCanvas(digit: number): HTMLCanvasElement {
   const safeDigit = ((digit % 10) + 10) % 10;
+  const cached = ballCanvasCache.get(safeDigit);
+  if (cached) return cached;
+
   const palette = BALL_DIGIT_PALETTE[safeDigit];
 
   const size = 256;
@@ -97,6 +110,16 @@ export function createBallDigitTexture(digit: number): THREE.CanvasTexture {
     }
   }
 
+  ballCanvasCache.set(safeDigit, canvas);
+  return canvas;
+}
+
+/**
+ * Generates an equirectangular stained-glass jewel ball CanvasTexture with rich
+ * saturated colors, dual gold-trimmed medallions, and high-contrast digit glyphs.
+ */
+export function createBallDigitTexture(digit: number): THREE.CanvasTexture {
+  const canvas = buildBallDigitCanvas(digit);
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.anisotropy = 4;
@@ -106,13 +129,14 @@ export function createBallDigitTexture(digit: number): THREE.CanvasTexture {
 
 export type SlotVisualState = 'idle' | 'hidden' | 'revealed';
 
-/**
- * Generates a pre-baked backlit plaque CanvasTexture for one digit slot on stage.
- */
-export function createSlotDigitTexture(
+function buildSlotDigitCanvas(
   label: string,
   state: SlotVisualState
-): THREE.CanvasTexture {
+): HTMLCanvasElement {
+  const cacheKey = `${state}:${label}`;
+  const cached = slotCanvasCache.get(cacheKey);
+  if (cached) return cached;
+
   const width = 256;
   const height = 320;
   const canvas = document.createElement('canvas');
@@ -169,6 +193,18 @@ export function createSlotDigitTexture(
     ctx.fillText(label, width / 2, height / 2 + 4);
   }
 
+  slotCanvasCache.set(cacheKey, canvas);
+  return canvas;
+}
+
+/**
+ * Generates a pre-baked backlit plaque CanvasTexture for one digit slot on stage.
+ */
+export function createSlotDigitTexture(
+  label: string,
+  state: SlotVisualState
+): THREE.CanvasTexture {
+  const canvas = buildSlotDigitCanvas(label, state);
   const texture = new THREE.CanvasTexture(canvas);
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.anisotropy = 4;
@@ -176,10 +212,8 @@ export function createSlotDigitTexture(
   return texture;
 }
 
-/**
- * Generates a soft warm radial glow sprite for floating atmospheric gold dust and bursts.
- */
-export function createGoldDustTexture(): THREE.CanvasTexture {
+function buildGoldDustCanvas(): HTMLCanvasElement {
+  if (goldDustCanvasCache) return goldDustCanvasCache;
   const size = 64;
   const canvas = document.createElement('canvas');
   canvas.width = size;
@@ -201,11 +235,126 @@ export function createGoldDustTexture(): THREE.CanvasTexture {
     ctx.fillStyle = grad;
     ctx.fillRect(0, 0, size, size);
   }
+  goldDustCanvasCache = canvas;
+  return canvas;
+}
 
-  const texture = new THREE.CanvasTexture(canvas);
+/**
+ * Generates a soft warm radial glow sprite for floating atmospheric gold dust and bursts.
+ */
+export function createGoldDustTexture(): THREE.CanvasTexture {
+  const texture = new THREE.CanvasTexture(buildGoldDustCanvas());
   texture.colorSpace = THREE.SRGBColorSpace;
   texture.needsUpdate = true;
   return texture;
+}
+
+function buildSnowflakeCanvas(): HTMLCanvasElement {
+  if (snowflakeCanvasCache) return snowflakeCanvasCache;
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+
+  if (ctx) {
+    const half = size / 2;
+    const glow = ctx.createRadialGradient(half, half, 0, half, half, half);
+    glow.addColorStop(0, 'rgba(255, 255, 255, 0.95)');
+    glow.addColorStop(0.45, 'rgba(224, 244, 255, 0.55)');
+    glow.addColorStop(1, 'rgba(224, 244, 255, 0)');
+    ctx.fillStyle = glow;
+    ctx.fillRect(0, 0, size, size);
+
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.92)';
+    ctx.lineCap = 'round';
+    ctx.lineWidth = 2.2;
+    for (let k = 0; k < 6; k++) {
+      const a = (k / 6) * Math.PI * 2;
+      const cos = Math.cos(a);
+      const sin = Math.sin(a);
+      ctx.beginPath();
+      ctx.moveTo(half, half);
+      ctx.lineTo(half + cos * (half - 7), half + sin * (half - 7));
+      ctx.stroke();
+
+      // Tiny crystalline branchlets
+      const bx = half + cos * (half * 0.55);
+      const by = half + sin * (half * 0.55);
+      ctx.beginPath();
+      ctx.moveTo(bx, by);
+      ctx.lineTo(bx + Math.cos(a + 0.6) * 7, by + Math.sin(a + 0.6) * 7);
+      ctx.moveTo(bx, by);
+      ctx.lineTo(bx + Math.cos(a - 0.6) * 7, by + Math.sin(a - 0.6) * 7);
+      ctx.stroke();
+    }
+  }
+  snowflakeCanvasCache = canvas;
+  return canvas;
+}
+
+/**
+ * Generates a delicate 6-pointed frosted snow crystal sprite for the Christmas theme.
+ */
+export function createSnowflakeTexture(): THREE.CanvasTexture {
+  const texture = new THREE.CanvasTexture(buildSnowflakeCanvas());
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+function buildPetalCanvas(): HTMLCanvasElement {
+  if (petalCanvasCache) return petalCanvasCache;
+  const size = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+
+  if (ctx) {
+    ctx.clearRect(0, 0, size, size);
+    ctx.beginPath();
+    ctx.moveTo(size * 0.5, size * 0.08);
+    ctx.bezierCurveTo(size * 0.92, size * 0.25, size * 0.85, size * 0.85, size * 0.5, size * 0.94);
+    ctx.bezierCurveTo(size * 0.15, size * 0.85, size * 0.08, size * 0.25, size * 0.5, size * 0.08);
+    ctx.closePath();
+
+    const grad = ctx.createRadialGradient(size * 0.5, size * 0.45, 2, size * 0.5, size * 0.5, size * 0.45);
+    grad.addColorStop(0, 'rgba(255, 255, 255, 1)');
+    grad.addColorStop(0.75, 'rgba(255, 255, 255, 0.92)');
+    grad.addColorStop(1, 'rgba(255, 255, 255, 0.65)');
+    ctx.fillStyle = grad;
+    ctx.fill();
+  }
+  petalCanvasCache = canvas;
+  return canvas;
+}
+
+/**
+ * Generates a soft curved blossom petal alpha mask for Easter flower petals.
+ */
+export function createPetalTexture(): THREE.CanvasTexture {
+  const texture = new THREE.CanvasTexture(buildPetalCanvas());
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.needsUpdate = true;
+  return texture;
+}
+
+/**
+ * Synchronously pre-renders stage offscreen canvases after webfont readiness
+ * so cold-start CanvasTexture creation causes zero draw-frame hitching.
+ */
+export function warmStageTextureCanvases(): void {
+  if (typeof document === 'undefined') return;
+  for (let d = 0; d <= 9; d++) {
+    buildBallDigitCanvas(d);
+    buildSlotDigitCanvas(String(d), 'revealed');
+  }
+  buildSlotDigitCanvas('✦', 'idle');
+  buildSlotDigitCanvas('?', 'hidden');
+  buildGoldDustCanvas();
+  buildSnowflakeCanvas();
+  buildPetalCanvas();
 }
 
 /**

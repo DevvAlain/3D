@@ -8,11 +8,14 @@ import {
   CheckCircle2,
   Eye,
   FastForward,
+  Gauge,
+  Loader2,
   Maximize2,
   Minimize2,
   Monitor,
   Pause,
   Play,
+  RefreshCw,
   RotateCcw,
   Sparkles,
   Trophy,
@@ -25,19 +28,12 @@ import {
   XCircle,
 } from 'lucide-react';
 import { formatTicket } from '@church/shared';
-import type {
-  DisplayController,
-  DisplayQualityPreset,
-} from '@/hooks/useDisplayController';
+import type { DisplayController } from '@/hooks/useDisplayController';
+import { QUALITY_LABELS } from '@/lib/quality-monitor';
+import { getStageThemeSpec } from '@/components/three/stage-themes';
 import { SignOutButton } from '@/components/auth/SignOutButton';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-
-const QUALITY_LABELS: Record<DisplayQualityPreset, string> = {
-  high: 'Cao (3D)',
-  medium: 'Trung bình (3D)',
-  low: 'Thấp (2D)',
-};
 
 interface DisplayStageChromeProps {
   controller: DisplayController;
@@ -46,6 +42,13 @@ interface DisplayStageChromeProps {
   /** Optional stage-specific visual body (2D cards rendered inside Chrome; 3D canvas fills backdrop). */
   children?: React.ReactNode;
 }
+
+const FALLBACK_2D_PARTICLES = Array.from({ length: 18 }, (_, i) => ({
+  leftPct: `${((i * 19 + 7) % 94) + 3}%`,
+  delaySec: `${-((i * 0.7) % 8).toFixed(2)}s`,
+  durationSec: `${(7.5 + (i % 5) * 1.4).toFixed(1)}s`,
+  sizePx: i % 3 === 0 ? 15 : 11,
+}));
 
 export function DisplayStageChrome({
   controller,
@@ -59,14 +62,19 @@ export function DisplayStageChrome({
     actorEmail,
     stageUnlocked,
     unlockStage,
+    assetsProgress,
     revealedDigits,
     isAnimating,
+    activeDrawSpeedMode,
+    currentPrizeSpeedMode,
     isFinalRevealVisible,
     betweenPrizes,
     dismissBetweenPrizes,
     submittingAction,
     isInCooldown,
     connectionStatus,
+    pendingRetryAction,
+    retryPendingAction,
     notice,
     clearNotice,
     isFullscreen,
@@ -95,10 +103,15 @@ export function DisplayStageChrome({
   const latestDraw = state.latestDraw;
   const activePrize = state.activePrize;
   const themeAccent = event?.primary_color || '#F5C451';
+  const themeSpec = React.useMemo(
+    () => getStageThemeSpec(event?.theme, themeAccent),
+    [event?.theme, themeAccent]
+  );
   const controlsBusy = Boolean(submittingAction) || isInCooldown;
   const canShowCelebrationCallout = Boolean(
     isFinalRevealVisible && !isAnimating && currentDraw && revealedDigits >= digits
   );
+  const displayedSpeedMode = currentDraw ? activeDrawSpeedMode : currentPrizeSpeedMode;
 
   // Auto-hide compact bottom control bar on mouse idle (keyboard shortcuts stay active 100% of the time)
   const [dockVisible, setDockVisible] = React.useState(true);
@@ -151,21 +164,51 @@ export function DisplayStageChrome({
 
   return (
     <div
+      data-stage-theme={themeSpec.id}
       className={
         variant === '3d'
           ? 'pointer-events-none fixed inset-0 z-10 flex flex-col justify-between text-parish-cream'
-          : 'relative flex min-h-screen flex-col overflow-hidden bg-parish-navy text-parish-cream'
+          : `relative flex min-h-screen flex-col overflow-hidden text-parish-cream ${themeSpec.css2dBgClass}`
       }
       style={
         variant === '2d'
           ? {
-              backgroundImage: `radial-gradient(circle at 50% 15%, ${themeAccent}22, transparent 58%), radial-gradient(circle at 85% 85%, rgba(142,27,46,0.22), transparent 55%)`,
+              backgroundImage: `radial-gradient(circle at 50% 15%, ${themeSpec.css2dOverlayStops[0]}, transparent 58%), radial-gradient(circle at 85% 85%, ${themeSpec.css2dOverlayStops[1]}, transparent 55%)`,
             }
           : undefined
       }
     >
+      {/* 2D Theme Particle Backdrop Overlay for Christmas (Snow) & Easter (Petals) */}
+      {variant === '2d' && (themeSpec.id === 'christmas' || themeSpec.id === 'easter') ? (
+        <div
+          aria-hidden
+          className="pointer-events-none fixed inset-0 z-0 overflow-hidden"
+        >
+          {FALLBACK_2D_PARTICLES.map((p, idx) => (
+            <span
+              key={idx}
+              className="parish-2d-particle absolute top-0 select-none"
+              style={
+                {
+                  left: p.leftPct,
+                  animationDelay: p.delaySec,
+                  '--fall-duration': p.durationSec,
+                  fontSize: `${p.sizePx}px`,
+                  color:
+                    themeSpec.id === 'christmas'
+                      ? '#E0F2FE'
+                      : themeSpec.petalColors[idx % themeSpec.petalColors.length],
+                } as React.CSSProperties
+              }
+            >
+              {themeSpec.id === 'christmas' ? '❄' : '✿'}
+            </span>
+          ))}
+        </div>
+      ) : null}
+
       {/* Fixed Prominent TEST MODE Banner + Preview Banner + Header Bar */}
-      <div className="pointer-events-auto">
+      <div className="pointer-events-auto z-20">
         {event?.test_mode ? (
           <div
             data-testid="test-mode-banner"
@@ -209,6 +252,13 @@ export function DisplayStageChrome({
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
+            {isPreview && !assetsProgress.done ? (
+              <div className="inline-flex items-center gap-1.5 rounded-full border border-parish-gold/30 bg-black/45 px-2.5 py-0.5 text-[11px] text-parish-goldLight">
+                <Loader2 className="h-3 w-3 animate-spin" />
+                Nạp tài nguyên {assetsProgress.percent}%
+              </div>
+            ) : null}
+
             {/* Live FPS Debug Pill (Toggle via D key) */}
             {showFps ? (
               <div
@@ -223,11 +273,12 @@ export function DisplayStageChrome({
             {/* Quality Preset Toggle (Q key) */}
             <button
               type="button"
+              data-testid="quality-preset-btn"
               onClick={cycleQuality}
               title={
                 fallbackReason
                   ? fallbackReason
-                  : 'Đổi chất lượng đồ họa sân khấu (Phím Q): Cao → Trung bình → Thấp (2D)'
+                  : 'Đổi chất lượng đồ họa sân khấu (Phím Q): Cao → Trung bình → Nhẹ (3D) → Thấp (2D)'
               }
               className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-black/40 px-2.5 py-1 text-xs font-medium text-parish-cream/90 transition-colors hover:border-parish-gold/50 hover:text-parish-goldLight"
             >
@@ -237,6 +288,8 @@ export function DisplayStageChrome({
 
             {/* Connection Status Dot */}
             <div
+              data-testid="connection-status-pill"
+              data-status={connectionStatus}
               className="inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-black/40 px-2.5 py-1 text-xs"
               title={`Tài khoản: ${actorEmail}`}
             >
@@ -250,7 +303,7 @@ export function DisplayStageChrome({
                 }`}
               />
               {connectionStatus === 'offline' ? (
-                <span className="flex items-center gap-1 text-red-300">
+                <span className="flex items-center gap-1 font-semibold text-red-300">
                   <WifiOff className="h-3.5 w-3.5" /> Mất kết nối
                 </span>
               ) : (
@@ -294,32 +347,63 @@ export function DisplayStageChrome({
           </div>
         </header>
 
-        {/* Alert banner for offline / errors / notices */}
-        {connectionStatus === 'offline' || notice || (variant === '2d' && fallbackReason) ? (
+        {/* Alert banner for offline / pending idempotent retry / errors / notices */}
+        {connectionStatus === 'offline' ||
+        pendingRetryAction ||
+        notice ||
+        (variant === '2d' && fallbackReason) ? (
           <div className="mx-auto mt-2 w-full max-w-4xl px-4">
             <div
-              className={`flex items-center justify-between gap-3 rounded-xl border px-4 py-1.5 text-xs shadow-lg backdrop-blur-md sm:text-sm ${
+              data-testid="stage-alert-banner"
+              className={`flex flex-wrap items-center justify-between gap-3 rounded-xl border px-4 py-1.5 text-xs shadow-lg backdrop-blur-md sm:text-sm ${
                 connectionStatus === 'offline' || notice?.type === 'error'
-                  ? 'border-red-400/50 bg-red-950/85 text-red-100'
+                  ? 'border-red-400/50 bg-red-950/90 text-red-100'
                   : notice?.type === 'success'
-                    ? 'border-emerald-400/50 bg-emerald-950/80 text-emerald-100'
+                    ? 'border-emerald-400/50 bg-emerald-950/85 text-emerald-100'
                     : 'border-parish-gold/40 bg-parish-night/90 text-parish-goldLight'
               }`}
             >
               <span>
                 {connectionStatus === 'offline'
-                  ? 'Đang mất kết nối tạm thời với máy chủ — giữ nguyên trạng thái và đang thử đồng bộ lại...'
+                  ? notice?.text ||
+                    'Đang mất kết nối tạm thời với máy chủ — kết quả đã lưu trên máy chủ vẫn an toàn và đang chờ đồng bộ lại...'
                   : notice?.text ?? fallbackReason}
               </span>
-              {notice ? (
-                <button
-                  type="button"
-                  onClick={clearNotice}
-                  className="shrink-0 text-xs underline opacity-80 hover:opacity-100"
-                >
-                  Đóng
-                </button>
-              ) : null}
+              <div className="flex shrink-0 items-center gap-2">
+                {pendingRetryAction ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    data-testid="retry-pending-action-btn"
+                    onClick={() => void retryPendingAction()}
+                    className="h-7 px-2.5 text-xs"
+                  >
+                    <RefreshCw className="h-3.5 w-3.5" />
+                    {pendingRetryAction.label}
+                  </Button>
+                ) : null}
+                {connectionStatus === 'offline' ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void refreshState()}
+                    className="h-7 px-2.5 text-xs"
+                  >
+                    <RotateCcw className="h-3 w-3" /> Đồng bộ lại
+                  </Button>
+                ) : null}
+                {notice ? (
+                  <button
+                    type="button"
+                    onClick={clearNotice}
+                    className="text-xs underline opacity-80 hover:opacity-100"
+                  >
+                    Đóng
+                  </button>
+                ) : null}
+              </div>
             </div>
           </div>
         ) : null}
@@ -327,7 +411,7 @@ export function DisplayStageChrome({
 
       {/* Main Content Area: Empty State / Completed Credits / Between Prizes / Variant Stage */}
       {!event ? (
-        <main className="pointer-events-auto flex flex-1 flex-col items-center justify-center p-6 text-center">
+        <main className="pointer-events-auto relative z-10 flex flex-1 flex-col items-center justify-center p-6 text-center">
           <div className="max-w-xl rounded-3xl border border-parish-gold/35 bg-parish-night/85 p-8 shadow-2xl backdrop-blur-md sm:p-10">
             <h2 className="font-title text-3xl font-bold text-parish-goldLight">
               Chưa có sự kiện nào đang kích hoạt
@@ -343,7 +427,7 @@ export function DisplayStageChrome({
       ) : state.isAllPrizesCompleted && !currentDraw ? (
         <main
           data-testid="summary-credits-screen"
-          className="pointer-events-auto flex flex-1 flex-col items-center justify-center overflow-hidden p-4 sm:p-6"
+          className="pointer-events-auto relative z-10 flex flex-1 flex-col items-center justify-center overflow-hidden p-4 sm:p-6"
         >
           <div className="flex h-full max-h-[84vh] w-full max-w-5xl flex-col rounded-3xl border border-parish-gold/45 bg-parish-night/90 p-5 shadow-2xl backdrop-blur-xl sm:p-7">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-parish-gold/20 pb-4">
@@ -459,7 +543,7 @@ export function DisplayStageChrome({
       ) : betweenPrizes && !currentDraw ? (
         <main
           data-testid="between-prizes-screen"
-          className="pointer-events-auto flex flex-1 flex-col items-center justify-center p-4 sm:p-6"
+          className="pointer-events-auto relative z-10 flex flex-1 flex-col items-center justify-center p-4 sm:p-6"
         >
           <div className="w-full max-w-3xl rounded-3xl border-2 border-parish-gold/55 bg-parish-night/95 p-6 text-center shadow-[0_0_70px_rgba(245,196,81,0.28)] backdrop-blur-xl sm:p-8">
             <Badge variant="success" className="px-4 py-1 text-xs uppercase tracking-widest">
@@ -525,7 +609,7 @@ export function DisplayStageChrome({
           </div>
         </main>
       ) : variant === '2d' ? (
-        children
+        <div className="relative z-10 flex flex-1 flex-col">{children}</div>
       ) : (
         /* 3D Overlay HUD: keeps the stage center and bottom digit slots unobstructed at all times */
         <div className="flex flex-1 flex-col justify-between p-3 sm:px-5 sm:pt-3 sm:pb-0">
@@ -541,6 +625,17 @@ export function DisplayStageChrome({
                       ? `Giải tiếp theo (${activePrize.won_count}/${activePrize.quantity})`
                       : 'Sẵn sàng'}
                 </Badge>
+                <span
+                  data-testid="active-prize-speed-badge"
+                  className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-semibold ${
+                    displayedSpeedMode === 'fast'
+                      ? 'border-emerald-400/40 bg-emerald-500/15 text-emerald-200'
+                      : 'border-parish-gold/45 bg-parish-gold/15 text-parish-goldLight'
+                  }`}
+                >
+                  <Gauge className="h-3 w-3" />
+                  {displayedSpeedMode === 'fast' ? 'Nhanh (~8s)' : 'Đầy đủ (~17s)'}
+                </span>
                 <span className="text-xs text-parish-cream/75">
                   Còn {state.validTicketsRemaining.toLocaleString('vi-VN')} /{' '}
                   {state.totalPoolSize.toLocaleString('vi-VN')} vé
@@ -560,7 +655,7 @@ export function DisplayStageChrome({
                 data-testid="winner-invitation-banner"
                 className="pointer-events-auto mx-auto flex items-center gap-2.5 rounded-2xl border-2 border-parish-gold bg-parish-night/90 px-4 py-2 text-center shadow-[0_0_38px_rgba(245,196,81,0.45)] backdrop-blur-md"
               >
-                <Sparkles className="h-5 w-5 shrink-0 text-parish-gold animate-pulse" />
+                <Sparkles className="h-5 w-5 shrink-0 animate-pulse text-parish-gold" />
                 <p className="font-title text-base font-extrabold tracking-wide text-parish-goldLight sm:text-lg">
                   Mời người giữ vé số{' '}
                   <span className="mx-1 rounded-md bg-parish-gold/20 px-2 py-0.5 font-mono text-lg text-white sm:text-xl">
@@ -568,7 +663,7 @@ export function DisplayStageChrome({
                   </span>{' '}
                   lên nhận thưởng
                 </p>
-                <Sparkles className="h-5 w-5 shrink-0 text-parish-gold animate-pulse" />
+                <Sparkles className="h-5 w-5 shrink-0 animate-pulse text-parish-gold" />
               </div>
             ) : null}
 
@@ -767,27 +862,69 @@ export function DisplayStageChrome({
         </div>
       )}
 
-      {/* Opaque Presenter Audio/Stage Unlock Gate (zero reveal flash on F5) */}
+      {/* Opaque Presenter Asset Preload & Audio Unlock Gate (zero reveal flash on F5) */}
       {!stageUnlocked && !isPreview ? (
         <div
           data-testid="stage-unlock-gate"
+          data-assets-ready={assetsProgress.done ? 'true' : 'false'}
+          data-preload-percent={assetsProgress.percent}
           className="pointer-events-auto fixed inset-0 z-50 flex items-center justify-center bg-parish-navy p-6"
         >
-          <div className="max-w-md rounded-3xl border border-parish-gold/45 bg-parish-night p-8 text-center shadow-2xl">
+          <div className="w-full max-w-md rounded-3xl border border-parish-gold/45 bg-parish-night p-8 text-center shadow-2xl">
             {event?.test_mode ? (
               <div className="mb-4 inline-flex items-center gap-2 rounded-full border border-red-400 bg-red-600/30 px-4 py-1 text-xs font-bold text-red-100">
                 <AlertTriangle className="h-4 w-4" /> ĐANG Ở CHẾ ĐỘ THỬ (TEST MODE)
               </div>
             ) : null}
+
             <h2 className="font-title text-3xl font-bold text-parish-goldLight">
               Sân Khấu Quay Số Sẵn Sàng
             </h2>
-            <p className="mt-3 text-sm text-parish-cream/80">
-              Nhấn nút bên dưới để kích hoạt bàn điều khiển trình chiếu và mở khóa âm thanh sân khấu.
+            <p className="mt-2.5 text-sm text-parish-cream/80">
+              Hệ thống tự động nạp sẵn font chữ, hiệu ứng âm thanh, texture vé 3D và bộ vật lý để quay thưởng mượt mà ngay cả khi mạng chập chờn.
             </p>
-            <Button size="lg" className="mt-6 w-full text-base" onClick={unlockStage}>
-              <Play className="h-5 w-5" />
-              Bấm để bắt đầu
+
+            {/* Asset Preloading Progress Bar */}
+            <div className="mt-5 rounded-2xl border border-parish-gold/25 bg-parish-navy/70 p-3.5 text-left">
+              <div className="flex items-center justify-between text-xs font-medium text-parish-goldLight">
+                <span className="flex items-center gap-1.5 truncate pr-2">
+                  {assetsProgress.done ? (
+                    <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-emerald-400" />
+                  ) : (
+                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-parish-gold" />
+                  )}
+                  <span className="truncate">{assetsProgress.currentLabel}</span>
+                </span>
+                <span className="shrink-0 font-mono font-bold">{assetsProgress.percent}%</span>
+              </div>
+              <div
+                data-testid="asset-preload-bar"
+                className="mt-2 h-2 w-full overflow-hidden rounded-full bg-black/50"
+              >
+                <div
+                  className="h-full rounded-full bg-gradient-to-r from-amber-500 via-parish-gold to-parish-goldLight transition-all duration-200"
+                  style={{ width: `${assetsProgress.percent}%` }}
+                />
+              </div>
+            </div>
+
+            <Button
+              size="lg"
+              disabled={!assetsProgress.done}
+              className="mt-6 w-full text-base"
+              onClick={unlockStage}
+            >
+              {assetsProgress.done ? (
+                <>
+                  <Play className="h-5 w-5" />
+                  Bấm để bắt đầu
+                </>
+              ) : (
+                <>
+                  <Loader2 className="h-5 w-5 animate-spin" />
+                  Đang chuẩn bị tài nguyên ({assetsProgress.percent}%)...
+                </>
+              )}
             </Button>
             <div className="mt-4">
               <SignOutButton variant="ghost" label="Đổi tài khoản khác" />

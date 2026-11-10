@@ -1,3 +1,5 @@
+import type { PrizeSpeedMode } from '@church/shared';
+
 export type RevealPhase =
   | 'idle'
   | 'intro'
@@ -19,6 +21,7 @@ export interface ActiveExtractionBall {
 
 export interface RevealSchedule {
   digits: number;
+  speedMode: PrizeSpeedMode;
   introSec: number;
   leadingCount: number;
   perLeadingDigitSec: number;
@@ -56,26 +59,36 @@ export interface RevealTimelineSnapshot {
 }
 
 /**
- * Computes a deterministic, GPU-independent stage reveal schedule totaling ~16-17.5s
- * for 3-8 digits so low-end and high-end GPUs share identical pacing.
+ * Computes a deterministic, GPU-independent stage reveal schedule:
+ * - 'full': ~16–18s dramatic buildup reserved for top/grand prizes
+ * - 'fast': ~8.0s brisk ceremonial cadence for small/high-count prizes
  */
-export function computeRevealSchedule(digits: number): RevealSchedule {
+export function computeRevealSchedule(
+  digits: number,
+  speedMode: PrizeSpeedMode = 'full'
+): RevealSchedule {
   const safeDigits = Math.max(1, Math.min(8, Math.round(digits)));
-  const introSec = 2.4;
+  const isFast = speedMode === 'fast';
+
+  const introSec = isFast ? 1.0 : 2.4;
   const leadingCount = Math.max(0, safeDigits - 1);
-  const finalSuspenseSec = 3.6;
-  const finalChuteSec = 1.1;
-  const finaleHoldSec = 2.2;
+  const finalSuspenseSec = isFast ? 1.85 : 3.6;
+  const finalChuteSec = isFast ? 0.72 : 1.1;
+  const finaleHoldSec = isFast ? 1.25 : 2.2;
 
   let perLeadingDigitSec = 0;
   let leadingBudget = 0;
   if (leadingCount > 0) {
-    leadingBudget =
-      safeDigits <= 4
-        ? 8.0
-        : safeDigits === 5
-          ? 8.8
-          : 9.2;
+    if (isFast) {
+      leadingBudget = safeDigits <= 4 ? 3.0 : safeDigits === 5 ? 3.2 : 3.4;
+    } else {
+      leadingBudget =
+        safeDigits <= 4
+          ? 8.0
+          : safeDigits === 5
+            ? 8.8
+            : 9.2;
+    }
     perLeadingDigitSec = leadingBudget / leadingCount;
   }
 
@@ -86,6 +99,7 @@ export function computeRevealSchedule(digits: number): RevealSchedule {
 
   return {
     digits: safeDigits,
+    speedMode,
     introSec,
     leadingCount,
     perLeadingDigitSec,
@@ -110,9 +124,10 @@ function clamp01(v: number): number {
  */
 export function evaluateRevealTimeline(
   digits: number,
-  elapsedSec: number
+  elapsedSec: number,
+  speedMode: PrizeSpeedMode = 'full'
 ): RevealTimelineSnapshot {
-  const schedule = computeRevealSchedule(digits);
+  const schedule = computeRevealSchedule(digits, speedMode);
   const t = Math.max(0, elapsedSec);
 
   if (t >= schedule.totalDurationSec) {
@@ -257,9 +272,10 @@ export function evaluateRevealTimeline(
   if (t < schedule.finalChuteStartSec) {
     const suspenseElapsed = t - schedule.finalSuspenseStartSec;
     const p = clamp01(suspenseElapsed / schedule.finalSuspenseSec);
-    const rampIn = clamp01(suspenseElapsed / 0.75);
+    const rampDuration = speedMode === 'fast' ? 0.35 : 0.75;
+    const rampIn = clamp01(suspenseElapsed / rampDuration);
     const dim = rampIn * (0.72 + p * 0.14);
-    const tickInterval = 0.62;
+    const tickInterval = speedMode === 'fast' ? 0.45 : 0.62;
     const suspenseTickStep = Math.floor(suspenseElapsed / tickInterval) + 1;
 
     return {

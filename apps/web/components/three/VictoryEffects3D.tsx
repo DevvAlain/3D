@@ -4,22 +4,16 @@ import * as React from 'react';
 import * as THREE from 'three';
 import { useFrame } from '@react-three/fiber';
 import { createGoldDustTexture } from '@/components/three/textures';
+import type { StageThemeSpec } from '@/components/three/stage-themes';
 
 interface VictoryEffects3DProps {
   /** Increments each time a live finale / fast-forward celebration should fire */
   burstKey: number;
+  palette: StageThemeSpec['confettiPalette'];
 }
 
 const CONFETTI_COUNT = 160;
 const FIREWORK_SPARK_COUNT = 96;
-const CONFETTI_PALETTE = [
-  '#F5C451', // Cathedral Gold
-  '#F43F5E', // Ruby Rose
-  '#3B82F6', // Sapphire
-  '#10B981', // Emerald
-  '#A855F7', // Amethyst
-  '#FFF2B2', // Ivory Spark
-];
 
 interface ConfettiParticle {
   x: number;
@@ -51,7 +45,7 @@ function seededUnit(idx: number, salt: number): number {
   return s - Math.floor(s);
 }
 
-export function VictoryEffects3D({ burstKey }: VictoryEffects3DProps) {
+export function VictoryEffects3D({ burstKey, palette }: VictoryEffects3DProps) {
   const confettiRef = React.useRef<THREE.InstancedMesh>(null);
   const sparksRef = React.useRef<THREE.Points>(null);
 
@@ -83,24 +77,24 @@ export function VictoryEffects3D({ burstKey }: VictoryEffects3DProps) {
     };
   }, [sparkTexture, sparkGeometry]);
 
-  // Pre-seed per-instance jewel colors cleanly once
+  // Pre-seed per-instance jewel colors cleanly whenever theme palette changes
   React.useEffect(() => {
     const mesh = confettiRef.current;
     if (!mesh) return;
     const c = new THREE.Color();
     for (let i = 0; i < CONFETTI_COUNT; i++) {
-      c.set(CONFETTI_PALETTE[i % CONFETTI_PALETTE.length]);
+      c.set(palette[i % palette.length]);
       mesh.setColorAt(i, c);
     }
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
 
     const colAttr = sparkGeometry.getAttribute('color') as THREE.BufferAttribute;
     for (let i = 0; i < FIREWORK_SPARK_COUNT; i++) {
-      c.set(CONFETTI_PALETTE[(i * 2) % CONFETTI_PALETTE.length]);
+      c.set(palette[(i * 2) % palette.length]);
       colAttr.setXYZ(i, c.r, c.g, c.b);
     }
     colAttr.needsUpdate = true;
-  }, [sparkGeometry]);
+  }, [sparkGeometry, palette]);
 
   // Reset burst simulation when burstKey advances (> 0)
   React.useEffect(() => {

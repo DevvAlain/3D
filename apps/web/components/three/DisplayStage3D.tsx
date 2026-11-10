@@ -14,6 +14,7 @@ import { LotteryCageAndBalls } from '@/components/three/LotteryCageAndBalls';
 import { DigitSlots3D } from '@/components/three/DigitSlots3D';
 import { StageCameraRig } from '@/components/three/StageCameraRig';
 import { VictoryEffects3D } from '@/components/three/VictoryEffects3D';
+import { getStageThemeSpec, type StageThemeSpec } from '@/components/three/stage-themes';
 
 interface CanvasErrorBoundaryProps {
   onError: () => void;
@@ -46,7 +47,9 @@ class CanvasErrorBoundary extends React.Component<
 
 interface StageLightingRigProps {
   isHigh: boolean;
+  isLight: boolean;
   primaryColor: string;
+  themeSpec: StageThemeSpec;
   revealTimelineRef: React.MutableRefObject<RevealTimelineSnapshot>;
 }
 
@@ -56,7 +59,9 @@ interface StageLightingRigProps {
  */
 function StageLightingRig({
   isHigh,
+  isLight,
   primaryColor,
+  themeSpec,
   revealTimelineRef,
 }: StageLightingRigProps) {
   const ambientRef = React.useRef<THREE.AmbientLight>(null);
@@ -76,14 +81,14 @@ function StageLightingRig({
     if (ambientRef.current) {
       ambientRef.current.intensity = THREE.MathUtils.lerp(
         ambientRef.current.intensity,
-        0.48 * fillScale,
+        (isLight ? 0.72 : 0.48) * fillScale,
         k
       );
     }
     if (hemiRef.current) {
       hemiRef.current.intensity = THREE.MathUtils.lerp(
         hemiRef.current.intensity,
-        0.64 * fillScale,
+        (isLight ? 0.88 : 0.64) * fillScale,
         k
       );
     }
@@ -126,8 +131,15 @@ function StageLightingRig({
 
   return (
     <>
-      <ambientLight ref={ambientRef} intensity={0.48} color="#D4E1FF" />
-      <hemisphereLight ref={hemiRef} args={['#FFE8B3', '#160B2E', 0.64]} />
+      <ambientLight
+        ref={ambientRef}
+        intensity={isLight ? 0.72 : 0.48}
+        color={themeSpec.ambientLightColor}
+      />
+      <hemisphereLight
+        ref={hemiRef}
+        args={[themeSpec.hemiSkyColor, themeSpec.hemiGroundColor, isLight ? 0.88 : 0.64]}
+      />
 
       <spotLight
         ref={spotRef}
@@ -141,20 +153,24 @@ function StageLightingRig({
         shadow-bias={-0.0004}
       />
 
-      <pointLight
-        ref={leftRimRef}
-        position={[-4.2, 2.6, -1.6]}
-        intensity={30}
-        distance={14}
-        color="#FFD062"
-      />
-      <pointLight
-        ref={rightRimRef}
-        position={[4.2, 2.6, -1.6]}
-        intensity={30}
-        distance={14}
-        color="#FFD062"
-      />
+      {!isLight ? (
+        <>
+          <pointLight
+            ref={leftRimRef}
+            position={[-4.2, 2.6, -1.6]}
+            intensity={30}
+            distance={14}
+            color={themeSpec.rimLightColor}
+          />
+          <pointLight
+            ref={rightRimRef}
+            position={[4.2, 2.6, -1.6]}
+            intensity={30}
+            distance={14}
+            color={themeSpec.rimLightColor}
+          />
+        </>
+      ) : null}
 
       <pointLight
         ref={roseBackRef}
@@ -193,17 +209,27 @@ export function DisplayStage3D({ controller }: DisplayStage3DProps) {
   const event = controller.state.event;
   const digits = event?.digits ?? 5;
   const primaryColor = event?.primary_color || '#F5C451';
+  const themeSpec = React.useMemo(
+    () => getStageThemeSpec(event?.theme, primaryColor),
+    [event?.theme, primaryColor]
+  );
+
   const isHigh = controller.quality === 'high';
+  const isLight = controller.quality === 'light';
   const currentTicket = controller.state.currentDraw?.ticket ?? null;
   const isSpinBoost =
     controller.isAnimating || Boolean(controller.state.currentDraw);
 
   return (
-    <div className="relative h-screen w-screen overflow-hidden bg-[#060918]">
+    <div
+      data-stage-theme={themeSpec.id}
+      className="relative h-screen w-screen overflow-hidden"
+      style={{ backgroundColor: themeSpec.skyColor }}
+    >
       <CanvasErrorBoundary onError={controller.handleWebGLContextLost}>
         <Canvas
           className="h-full w-full"
-          dpr={isHigh ? [1, 2] : [1, 1.5]}
+          dpr={isHigh ? [1, 2] : isLight ? 1 : [1, 1.5]}
           shadows={isHigh}
           camera={{ position: [0, 0.85, 8.73], fov: 42, near: 0.1, far: 50 }}
           gl={{
@@ -225,60 +251,66 @@ export function DisplayStage3D({ controller }: DisplayStage3DProps) {
             };
           }}
         >
-          <color attach="background" args={['#060918']} />
-          <fog attach="fog" args={['#060918', 11, 25]} />
+          <color attach="background" args={[themeSpec.skyColor]} />
+          <fog attach="fog" args={[themeSpec.fogColor, 11, 25]} />
 
-          {/* Procedural Sanctuary Cubemap Reflections (baked once, zero network assets) */}
-          <Environment resolution={128} frames={1}>
-            <Lightformer
-              form="ring"
-              intensity={2.4}
-              color="#FFE9A8"
-              scale={[6, 6, 1]}
-              position={[0, 5.5, 2]}
-              rotation={[Math.PI / 2, 0, 0]}
-            />
-            <Lightformer
-              form="circle"
-              intensity={2.2}
-              color={primaryColor}
-              scale={5}
-              position={[0, 2.5, -5.5]}
-            />
-            <Lightformer
-              form="rect"
-              intensity={1.7}
-              color="#E11D48"
-              scale={[3.2, 5, 1]}
-              position={[-5.5, 2, -1]}
-              rotation={[0, Math.PI / 2.2, 0]}
-            />
-            <Lightformer
-              form="rect"
-              intensity={1.7}
-              color="#2563EB"
-              scale={[3.2, 5, 1]}
-              position={[5.5, 2, -1]}
-              rotation={[0, -Math.PI / 2.2, 0]}
-            />
-          </Environment>
+          {/* Procedural Sanctuary Cubemap Reflections (skipped in Light 3D for maximum FPS) */}
+          {!isLight ? (
+            <Environment resolution={128} frames={1}>
+              <Lightformer
+                form="ring"
+                intensity={2.4}
+                color="#FFE9A8"
+                scale={[6, 6, 1]}
+                position={[0, 5.5, 2]}
+                rotation={[Math.PI / 2, 0, 0]}
+              />
+              <Lightformer
+                form="circle"
+                intensity={2.2}
+                color={primaryColor}
+                scale={5}
+                position={[0, 2.5, -5.5]}
+              />
+              <Lightformer
+                form="rect"
+                intensity={1.7}
+                color={themeSpec.rosePetals[0]}
+                scale={[3.2, 5, 1]}
+                position={[-5.5, 2, -1]}
+                rotation={[0, Math.PI / 2.2, 0]}
+              />
+              <Lightformer
+                form="rect"
+                intensity={1.7}
+                color={themeSpec.rosePetals[1]}
+                scale={[3.2, 5, 1]}
+                position={[5.5, 2, -1]}
+                rotation={[0, -Math.PI / 2.2, 0]}
+              />
+            </Environment>
+          ) : null}
 
           <StageLightingRig
             isHigh={isHigh}
+            isLight={isLight}
             primaryColor={primaryColor}
+            themeSpec={themeSpec}
             revealTimelineRef={controller.revealTimelineRef}
           />
 
           <StageCameraRig
             digits={digits}
-            measureFps={controller.showFps}
+            quality={controller.quality}
             onFpsSample={setFps}
+            onAutoDowngradeQuality={controller.handleAutoDowngradeQuality}
             revealTimelineRef={controller.revealTimelineRef}
           />
 
           <StainedGlassBackdrop
             quality={controller.quality}
             primaryColor={primaryColor}
+            themeSpec={themeSpec}
             revealTimelineRef={controller.revealTimelineRef}
           />
 
@@ -289,6 +321,7 @@ export function DisplayStage3D({ controller }: DisplayStage3DProps) {
                 isSpinBoost={isSpinBoost}
                 digits={digits}
                 activeRevealTicketDigits={controller.activeRevealTicketDigits}
+                themeSpec={themeSpec}
                 revealTimelineRef={controller.revealTimelineRef}
               />
             </Physics>
@@ -299,10 +332,14 @@ export function DisplayStage3D({ controller }: DisplayStage3DProps) {
             currentTicket={currentTicket}
             revealedDigits={controller.revealedDigits}
             isFinalReveal={controller.isFinalRevealVisible}
+            themeSpec={themeSpec}
             revealTimelineRef={controller.revealTimelineRef}
           />
 
-          <VictoryEffects3D burstKey={controller.confettiBurstKey} />
+          <VictoryEffects3D
+            burstKey={controller.confettiBurstKey}
+            palette={themeSpec.confettiPalette}
+          />
 
           {isHigh ? (
             <EffectComposer multisampling={0}>
