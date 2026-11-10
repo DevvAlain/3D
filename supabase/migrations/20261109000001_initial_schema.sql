@@ -3,24 +3,11 @@
 -- Church Lucky Draw - Core Schema, Constraints, RLS, Realtime & Storage
 -- ==============================================================================
 
--- 0. SCHEMAS & EXTENSIONS SETUP
+-- 0. EXTENSIONS & DEFAULT PRIVILEGES
 CREATE SCHEMA IF NOT EXISTS extensions;
-CREATE SCHEMA IF NOT EXISTS auth;
 CREATE EXTENSION IF NOT EXISTS "pgcrypto" WITH SCHEMA extensions;
 
--- Mock/fallback for auth.jwt() if running in standard Postgres / local test environment
-CREATE OR REPLACE FUNCTION auth.jwt()
-RETURNS jsonb
-LANGUAGE sql
-STABLE
-AS $$
-  SELECT COALESCE(
-    nullif(current_setting('request.jwt.claims', true), '')::jsonb,
-    '{}'::jsonb
-  );
-$$;
-
--- Default Privileges: revoke execution on future functions from public/anon/authenticated
+-- Revoke execution on future functions from public/anon/authenticated
 ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC, anon, authenticated;
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT EXECUTE ON FUNCTIONS TO service_role;
 
@@ -88,10 +75,12 @@ CREATE TABLE IF NOT EXISTS public.prizes (
 CREATE INDEX IF NOT EXISTS idx_prizes_event_sort ON public.prizes (event_id, sort_order ASC);
 
 -- 4. DRAWS TABLE
+-- FKs use ON DELETE RESTRICT to prevent accidental loss of draw audit history.
+-- Deliberate resets must go through reset_event(event_id) via service_role.
 CREATE TABLE IF NOT EXISTS public.draws (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    event_id UUID NOT NULL REFERENCES public.events(id) ON DELETE CASCADE,
-    prize_id UUID NOT NULL REFERENCES public.prizes(id) ON DELETE CASCADE,
+    event_id UUID NOT NULL REFERENCES public.events(id) ON DELETE RESTRICT,
+    prize_id UUID NOT NULL REFERENCES public.prizes(id) ON DELETE RESTRICT,
     ticket INT NOT NULL,
     status TEXT NOT NULL DEFAULT 'revealing',
     seq INT NOT NULL,
@@ -100,7 +89,8 @@ CREATE TABLE IF NOT EXISTS public.draws (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
-    CONSTRAINT chk_draw_status CHECK (status IN ('revealing', 'won', 'absent', 'void'))
+    CONSTRAINT chk_draw_status CHECK (status IN ('revealing', 'won', 'absent', 'void')),
+    CONSTRAINT uq_draws_event_test_seq UNIQUE (event_id, is_test, seq)
 );
 
 -- Partial Unique Index:
@@ -175,8 +165,9 @@ $$;
 REVOKE ALL ON FUNCTION public.is_admin() FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.is_admin() TO authenticated, service_role;
 
--- RLS Policies: Anonymous / Public has NO SELECT by default
--- Admin has full CRUD permissions
+-- RLS Policies:
+-- Anonymous / Public has NO SELECT on any table.
+-- Admin has full CRUD on config tables (events, excluded_tickets, prizes).
 CREATE POLICY admin_all_events ON public.events
     FOR ALL
     TO authenticated
@@ -195,11 +186,20 @@ CREATE POLICY admin_all_prizes ON public.prizes
     USING (public.is_admin())
     WITH CHECK (public.is_admin());
 
-CREATE POLICY admin_all_draws ON public.draws
-    FOR ALL
+-- Draws RLS: Admin has SELECT-only access.
+-- All writes (INSERT/UPDATE/DELETE) on draws must go exclusively through service_role RPCs.
+CREATE POLICY admin_select_draws ON public.draws
+    FOR SELECT
     TO authenticated
-    USING (public.is_admin())
-    WITH CHECK (public.is_admin());
+    USING (public.is_admin());
+
+-- Table-level defense in depth:
+-- Revoke all access from PUBLIC and anon; restrict authenticated on draws to SELECT only.
+REVOKE ALL ON public.events, public.excluded_tickets, public.prizes, public.draws FROM PUBLIC, anon;
+REVOKE ALL ON public.draws FROM authenticated;
+GRANT SELECT ON public.draws TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.events, public.excluded_tickets, public.prizes TO authenticated;
+GRANT ALL ON public.events, public.excluded_tickets, public.prizes, public.draws TO service_role;
 
 -- 7. REALTIME PUBLICATION
 DO $$
@@ -217,6 +217,7 @@ BEGIN
 END $$;
 
 -- 8. STORAGE BUCKET: event-assets
+-- Public read, admin-only write, SVG disallowed for XSS safety
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'storage') THEN
@@ -230,7 +231,6 @@ BEGIN
                 'image/png',
                 'image/jpeg',
                 'image/webp',
-                'image/svg+xml',
                 'audio/mpeg',
                 'audio/ogg',
                 'audio/wav',

@@ -38,27 +38,36 @@ church-lucky-draw/
 
 ---
 
-## 🔐 Thiết Lập Xác Thực & Tài Khoản Admin Duy Nhất
+## 🔐 Thiết Lập Xác Thực & Phân Quyền (`admin` và `presenter`)
+
+Hệ thống tách biệt chặt chẽ hai vai trò người dùng qua `app_metadata.role`:
+- **`admin`**: Toàn quyền cấu hình sự kiện, giải thưởng, vé loại trừ, xem lịch sử trúng thưởng theo thời gian thực. **Không có nút quay số**.
+- **`presenter`**: Người điều khiển màn hình trình chiếu `/display`. Chỉ được phép gọi các API quay số (`/api/draw/*` qua Next.js server). Không có quyền truy cập cấu hình hoặc ghi trực tiếp vào DB.
 
 ### 1. Vô hiệu hóa đăng ký công khai (Disable Public Sign-ups)
 Để đảm bảo an toàn tuyệt đối cho sự kiện:
 1. Truy cập **Supabase Dashboard** -> **Authentication** -> **Providers** -> **Email**.
 2. **Bỏ chọn (Disable)** mục **"Allow new users to sign up"** (hoặc "Enable Email Signup").
-3. Nhấn **Save**. Lúc này chỉ có người quản trị được mời hoặc tạo trực tiếp mới có tài khoản.
+3. Nhấn **Save**. Lúc này chỉ có tài khoản do ban tổ chức tạo mới đăng nhập được.
 
-### 2. Tạo tài khoản Admin duy nhất & gán quyền `app_metadata.role = 'admin'`
-Bạn có thể tạo tài khoản qua Supabase Dashboard -> **Authentication** -> **Users** -> **Add user**.
+### 2. Tạo tài khoản `admin` và `presenter` & gán `app_metadata.role`
+Tạo 2 tài khoản qua **Supabase Dashboard** -> **Authentication** -> **Users** -> **Add user** (ví dụ `admin@parish.org` và `presenter@parish.org`).
 
-Sau đó, mở **SQL Editor** trên Supabase Dashboard và chạy lệnh sau để gán quyền Admin:
+Sau đó, mở **SQL Editor** trên Supabase Dashboard và chạy lệnh sau để gán role vào `app_metadata`:
 
 ```sql
--- Gán quyền admin vào app_metadata (được kiểm tra an toàn trong RLS is_admin())
+-- Gán quyền admin (được kiểm tra bởi RLS is_admin())
 UPDATE auth.users
-SET raw_app_meta_data = raw_app_meta_data || '{"role": "admin"}'::jsonb
-WHERE email = 'admin@your-parish.org';
+SET raw_app_meta_data = COALESCE(raw_app_meta_data, '{}'::jsonb) || '{"role": "admin"}'::jsonb
+WHERE email = 'admin@parish.org';
+
+-- Gán quyền presenter (được kiểm tra ở Next.js API Route Handlers)
+UPDATE auth.users
+SET raw_app_meta_data = COALESCE(raw_app_meta_data, '{}'::jsonb) || '{"role": "presenter"}'::jsonb
+WHERE email = 'presenter@parish.org';
 ```
 
-Hoặc tạo trực tiếp qua Node.js Supabase Admin API với Service Role Key:
+Hoặc tạo trực tiếp qua Node.js Supabase Admin API với `SUPABASE_SERVICE_ROLE_KEY`:
 
 ```ts
 import { createClient } from '@supabase/supabase-js';
@@ -69,11 +78,20 @@ const supabaseAdmin = createClient(
   { auth: { autoRefreshToken: false, persistSession: false } }
 );
 
+// 1. Tạo tài khoản Admin
 await supabaseAdmin.auth.admin.createUser({
-  email: 'admin@your-parish.org',
-  password: 'SecurePassword2026!',
+  email: 'admin@parish.org',
+  password: 'SecureAdminPassword2026!',
   email_confirm: true,
   app_metadata: { role: 'admin' },
+});
+
+// 2. Tạo tài khoản Presenter (Màn hình sân khấu)
+await supabaseAdmin.auth.admin.createUser({
+  email: 'presenter@parish.org',
+  password: 'SecurePresenterPassword2026!',
+  email_confirm: true,
+  app_metadata: { role: 'presenter' },
 });
 ```
 
@@ -89,30 +107,25 @@ pnpm install
 
 ### 2. Thiết lập Biến Môi Trường
 
-Tạo file `.env` tại thư mục root (tham khảo file `.env.example`):
+Sao chép `.env.example` thành `.env` tại thư mục root và điền giá trị thực từ Supabase Dashboard:
 
 ```bash
-# Public credentials (truyền an toàn cho browser bundle)
-NEXT_PUBLIC_SUPABASE_URL=https://your-project-id.supabase.co
-NEXT_PUBLIC_SUPABASE_ANON_KEY=sb_publishable_your_key_here
-
-# Server-only credentials (TUYỆT ĐỐI KHÔNG để lộ ra client)
-SUPABASE_URL=https://your-project-id.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=sb_secret_your_service_role_key_here
-DATABASE_URL=postgresql://postgres:[YOUR-PASSWORD]@db.your-project-id.supabase.co:5432/postgres
+cp .env.example .env
 ```
+
+> ⚠️ **Cảnh báo bảo mật**: Tuyệt đối không đặt tiền tố `NEXT_PUBLIC_` cho `SUPABASE_SERVICE_ROLE_KEY` hoặc `DATABASE_URL`. Các key này chỉ dùng ở phía server.
 
 ### 3. Áp dụng Database Migrations với Supabase CLI
 
 Thư mục `supabase/migrations/` chỉ chứa 2 file schema & RPCs chính thức:
-- `20261109000001_initial_schema.sql`: Bảng, Partial Unique Indexes, RLS policies, Realtime publication, Storage bucket.
-- `20261109000002_draw_rpcs.sql`: Hàm `draw_next`, `confirm_won`, `mark_absent`, `void_last`, `clear_test_draws`, CSPRNG rejection sampling.
+- `20261109000001_initial_schema.sql`: Bảng, `ON DELETE RESTRICT`, `UNIQUE (event_id, is_test, seq)`, Partial Unique Indexes, RLS (`draws` chỉ SELECT cho admin), Realtime publication, Storage bucket (chỉ PNG/JPEG/WEBP/Audio, bỏ SVG).
+- `20261109000002_draw_rpcs.sql`: Hàm `draw_next`, `confirm_won`, `mark_absent`, `void_last`, `clear_test_draws`, `reset_event`, CSPRNG rejection sampling.
 
 File dữ liệu mẫu `supabase/seed.sql` được tách riêng, không nằm trong migrations.
 
 Để đẩy migration lên Supabase:
 ```bash
-supabase link --project-ref your-project-id
+supabase link --project-ref <your-project-ref>
 supabase db push
 ```
 
@@ -127,9 +140,9 @@ psql "$DATABASE_URL" -f supabase/seed.sql
 pnpm test
 ```
 
-### 5. Chạy Integration Test Suite (7 Kịch bản chuyên sâu)
+### 5. Chạy Integration Test Suite (8 Kịch bản Multi-Connection chuyên sâu)
 
-Chạy kịch bản kiểm thử toàn diện độc lập (Partial Unique Index, Concurrency Row Lock, Idempotency, Quyền hạn phân quyền anon/authenticated bị từ chối, State transitions, 350+ draws liên tiếp không trùng lặp):
+Kịch bản tự động chạy trên `supabase start` (nếu đang chạy ở cổng 54321/54322) hoặc tự khởi tạo Embedded PostgreSQL cục bộ với 25 kết nối song song (`pg.Pool`):
 
 ```bash
 pnpm test:integration

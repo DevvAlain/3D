@@ -44,12 +44,13 @@ REVOKE ALL ON FUNCTION public.crypto_random_int(BIGINT) FROM PUBLIC, anon, authe
 GRANT EXECUTE ON FUNCTION public.crypto_random_int(BIGINT) TO service_role;
 
 -- 2. Main RPC: draw_next
--- Atomically locks event, validates active revealing state, determines next prize quota,
+-- Derives is_test directly from events.test_mode. Rejects if event is not active.
+-- Atomically locks event, checks revealing state, determines next prize quota,
 -- computes valid ticket pool, picks ticket uniformly without bias, records draw.
+-- Returns consistent JSON shape in all branches: { draw, prize, is_idempotent }.
 CREATE OR REPLACE FUNCTION public.draw_next(
     p_event_id UUID,
-    p_idempotency_key TEXT DEFAULT NULL,
-    p_is_test BOOLEAN DEFAULT NULL
+    p_idempotency_key TEXT DEFAULT NULL
 )
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -59,13 +60,14 @@ AS $$
 DECLARE
     v_event public.events%ROWTYPE;
     v_prize public.prizes%ROWTYPE;
-    v_existing_draw RECORD;
+    v_existing_draw public.draws%ROWTYPE;
     v_new_draw public.draws%ROWTYPE;
     v_is_test BOOLEAN;
     v_valid_count BIGINT;
     v_k BIGINT;
     v_chosen_ticket INT;
     v_next_seq INT;
+    v_clean_key TEXT;
 BEGIN
     -- 1. Lock the event row to serialize all draws & state transitions
     SELECT * INTO v_event
@@ -77,24 +79,30 @@ BEGIN
         RAISE EXCEPTION 'EVENT_NOT_FOUND: Sự kiện không tồn tại (id: %)', p_event_id;
     END IF;
 
-    -- Determine test mode: use passed flag or fall back to event.test_mode
-    v_is_test := COALESCE(p_is_test, v_event.test_mode, false);
+    IF NOT v_event.is_active THEN
+        RAISE EXCEPTION 'EVENT_NOT_ACTIVE: Sự kiện chưa được kích hoạt (is_active = false)';
+    END IF;
 
-    -- 2. Idempotency Check: if key provided and draw exists, return it immediately
-    IF p_idempotency_key IS NOT NULL AND length(trim(p_idempotency_key)) > 0 THEN
-        SELECT 
-            d.id, d.event_id, d.prize_id, d.ticket, d.status, d.seq, d.idempotency_key, d.is_test, d.created_at,
-            row_to_json(p.*) AS prize
-        INTO v_existing_draw
+    -- Derive is_test strictly from event configuration
+    v_is_test := v_event.test_mode;
+    v_clean_key := NULLIF(trim(p_idempotency_key), '');
+
+    -- 2. Idempotency Check: if key provided and draw exists, return consistent { draw, prize, is_idempotent }
+    IF v_clean_key IS NOT NULL THEN
+        SELECT d.* INTO v_existing_draw
         FROM public.draws d
-        JOIN public.prizes p ON p.id = d.prize_id
         WHERE d.event_id = p_event_id
           AND d.is_test = v_is_test
-          AND d.idempotency_key = trim(p_idempotency_key);
+          AND d.idempotency_key = v_clean_key;
 
         IF FOUND THEN
+            SELECT p.* INTO v_prize
+            FROM public.prizes p
+            WHERE p.id = v_existing_draw.prize_id;
+
             RETURN jsonb_build_object(
                 'draw', row_to_json(v_existing_draw),
+                'prize', row_to_json(v_prize),
                 'is_idempotent', true
             );
         END IF;
@@ -195,12 +203,12 @@ BEGIN
         v_chosen_ticket,
         'revealing',
         v_next_seq,
-        NULLIF(trim(p_idempotency_key), ''),
+        v_clean_key,
         v_is_test
     )
     RETURNING * INTO v_new_draw;
 
-    -- 10. Return Composite Object
+    -- 10. Return Consistent Composite Object: { draw, prize, is_idempotent }
     RETURN jsonb_build_object(
         'draw', row_to_json(v_new_draw),
         'prize', row_to_json(v_prize),
@@ -209,12 +217,12 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.draw_next(UUID, TEXT, BOOLEAN) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.draw_next(UUID, TEXT, BOOLEAN) TO service_role;
+REVOKE ALL ON FUNCTION public.draw_next(UUID, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.draw_next(UUID, TEXT) TO service_role;
 
 -- 3. RPC: confirm_won
 -- Transitions a draw from 'revealing' to 'won'
--- Locks the event row FOR UPDATE to serialize with draw_next.
+-- Always acquires lock on parent event row FIRST to prevent deadlocks and serialize with draw_next/void_last.
 CREATE OR REPLACE FUNCTION public.confirm_won(p_draw_id UUID)
 RETURNS JSONB
 LANGUAGE plpgsql
@@ -222,8 +230,22 @@ SECURITY DEFINER
 SET search_path = public, extensions
 AS $$
 DECLARE
+    v_event_id UUID;
     v_draw public.draws%ROWTYPE;
 BEGIN
+    -- Look up event_id without lock first
+    SELECT event_id INTO v_event_id
+    FROM public.draws
+    WHERE id = p_draw_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'DRAW_NOT_FOUND: Lượt quay không tồn tại (id: %)', p_draw_id;
+    END IF;
+
+    -- Lock hierarchy: ALWAYS lock parent events row BEFORE draws row
+    PERFORM 1 FROM public.events WHERE id = v_event_id FOR UPDATE;
+
+    -- Lock the draw row now that we hold the event lock
     SELECT * INTO v_draw
     FROM public.draws
     WHERE id = p_draw_id
@@ -232,9 +254,6 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'DRAW_NOT_FOUND: Lượt quay không tồn tại (id: %)', p_draw_id;
     END IF;
-
-    -- Lock parent event row to synchronize with draw_next
-    PERFORM 1 FROM public.events WHERE id = v_draw.event_id FOR UPDATE;
 
     IF v_draw.status <> 'revealing' THEN
         RAISE EXCEPTION 'INVALID_STATE_TRANSITION: Chỉ có thể xác nhận trúng thưởng khi đang ở trạng thái revealing (hiện tại: %)', v_draw.status;
@@ -254,7 +273,7 @@ GRANT EXECUTE ON FUNCTION public.confirm_won(UUID) TO service_role;
 
 -- 4. RPC: mark_absent
 -- Transitions a draw from 'revealing' to 'absent'
--- Locks the event row FOR UPDATE to serialize with draw_next.
+-- Always acquires lock on parent event row FIRST to prevent deadlocks and serialize with draw_next/void_last.
 -- Ticket remains permanently excluded, does NOT count toward prize quota.
 CREATE OR REPLACE FUNCTION public.mark_absent(p_draw_id UUID)
 RETURNS JSONB
@@ -263,8 +282,22 @@ SECURITY DEFINER
 SET search_path = public, extensions
 AS $$
 DECLARE
+    v_event_id UUID;
     v_draw public.draws%ROWTYPE;
 BEGIN
+    -- Look up event_id without lock first
+    SELECT event_id INTO v_event_id
+    FROM public.draws
+    WHERE id = p_draw_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'DRAW_NOT_FOUND: Lượt quay không tồn tại (id: %)', p_draw_id;
+    END IF;
+
+    -- Lock hierarchy: ALWAYS lock parent events row BEFORE draws row
+    PERFORM 1 FROM public.events WHERE id = v_event_id FOR UPDATE;
+
+    -- Lock the draw row now that we hold the event lock
     SELECT * INTO v_draw
     FROM public.draws
     WHERE id = p_draw_id
@@ -273,9 +306,6 @@ BEGIN
     IF NOT FOUND THEN
         RAISE EXCEPTION 'DRAW_NOT_FOUND: Lượt quay không tồn tại (id: %)', p_draw_id;
     END IF;
-
-    -- Lock parent event row to synchronize with draw_next
-    PERFORM 1 FROM public.events WHERE id = v_draw.event_id FOR UPDATE;
 
     IF v_draw.status <> 'revealing' THEN
         RAISE EXCEPTION 'INVALID_STATE_TRANSITION: Chỉ có thể đánh dấu vắng mặt khi đang ở trạng thái revealing (hiện tại: %)', v_draw.status;
@@ -294,29 +324,35 @@ REVOKE ALL ON FUNCTION public.mark_absent(UUID) FROM PUBLIC, anon, authenticated
 GRANT EXECUTE ON FUNCTION public.mark_absent(UUID) TO service_role;
 
 -- 5. RPC: void_last
--- Voids ONLY the latest draw for this event & test mode. Allowed only from 'revealing' or 'won'.
--- Locks parent event row FIRST to serialize with draw_next.
+-- Derives is_test from events.test_mode.
+-- Voids ONLY the latest draw for this event & mode. Allowed only from 'revealing' or 'won'.
+-- Locks parent event row FIRST to serialize with draw_next / mark_absent / confirm_won.
 -- Ticket is returned to the pool because status becomes 'void'.
-CREATE OR REPLACE FUNCTION public.void_last(
-    p_event_id UUID,
-    p_is_test BOOLEAN DEFAULT false
-)
+CREATE OR REPLACE FUNCTION public.void_last(p_event_id UUID)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
 SET search_path = public, extensions
 AS $$
 DECLARE
+    v_event public.events%ROWTYPE;
     v_draw public.draws%ROWTYPE;
 BEGIN
     -- Lock parent event row FIRST
-    PERFORM 1 FROM public.events WHERE id = p_event_id FOR UPDATE;
+    SELECT * INTO v_event
+    FROM public.events
+    WHERE id = p_event_id
+    FOR UPDATE;
 
-    -- Find and lock the latest draw
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'EVENT_NOT_FOUND: Sự kiện không tồn tại (id: %)', p_event_id;
+    END IF;
+
+    -- Find and lock the latest draw for the derived test_mode
     SELECT * INTO v_draw
     FROM public.draws
     WHERE event_id = p_event_id
-      AND is_test = p_is_test
+      AND is_test = v_event.test_mode
     ORDER BY seq DESC
     LIMIT 1
     FOR UPDATE;
@@ -338,8 +374,8 @@ BEGIN
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.void_last(UUID, BOOLEAN) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.void_last(UUID, BOOLEAN) TO service_role;
+REVOKE ALL ON FUNCTION public.void_last(UUID) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.void_last(UUID) TO service_role;
 
 -- 6. RPC: clear_test_draws
 -- Resets only test mode draws for an event
@@ -367,3 +403,33 @@ $$;
 
 REVOKE ALL ON FUNCTION public.clear_test_draws(UUID) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.clear_test_draws(UUID) TO service_role;
+
+-- 7. RPC: reset_event
+-- Deliberate reset of all draw history for an event (protected by service_role only)
+CREATE OR REPLACE FUNCTION public.reset_event(p_event_id UUID)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions
+AS $$
+DECLARE
+    v_deleted_count INT;
+BEGIN
+    -- Lock parent event row
+    PERFORM 1 FROM public.events WHERE id = p_event_id FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'EVENT_NOT_FOUND: Sự kiện không tồn tại (id: %)', p_event_id;
+    END IF;
+
+    DELETE FROM public.draws
+    WHERE event_id = p_event_id;
+
+    GET DIAGNOSTICS v_deleted_count = ROW_COUNT;
+
+    RETURN jsonb_build_object('success', true, 'deleted_draws', v_deleted_count);
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.reset_event(UUID) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.reset_event(UUID) TO service_role;

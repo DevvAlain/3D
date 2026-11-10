@@ -5,6 +5,9 @@ import {
   PrizeSchema,
   PrizeCreateSchema,
   DrawNextRequestSchema,
+  UserRoleSchema,
+  isAdminRole,
+  isPresenterRole,
 } from '../src/schemas';
 
 describe('Event Schemas', () => {
@@ -106,12 +109,11 @@ describe('Prize Schemas', () => {
   });
 });
 
-describe('Draw Request Schemas', () => {
+describe('Draw Request Schemas & User Roles', () => {
   it('validates draw next request with idempotency key', () => {
     const result = DrawNextRequestSchema.safeParse({
       event_id: 'a0000000-0000-0000-0000-000000000001',
       idempotency_key: 'req_12345_abc',
-      is_test: false,
     });
     expect(result.success).toBe(true);
   });
@@ -121,5 +123,15 @@ describe('Draw Request Schemas', () => {
       event_id: 'not-a-uuid',
     });
     expect(result.success).toBe(false);
+  });
+
+  it('validates user roles (admin and presenter)', () => {
+    expect(UserRoleSchema.safeParse('admin').success).toBe(true);
+    expect(UserRoleSchema.safeParse('presenter').success).toBe(true);
+    expect(UserRoleSchema.safeParse('guest').success).toBe(false);
+    expect(isAdminRole('admin')).toBe(true);
+    expect(isAdminRole('presenter')).toBe(false);
+    expect(isPresenterRole('presenter')).toBe(true);
+    expect(isPresenterRole('admin')).toBe(false);
   });
 });

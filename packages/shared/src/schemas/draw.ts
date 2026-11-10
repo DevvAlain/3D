@@ -22,9 +22,15 @@ export type Draw = z.infer<typeof DrawSchema>;
 export const DrawNextRequestSchema = z.object({
   event_id: z.string().uuid('ID sự kiện không hợp lệ'),
   idempotency_key: z.string().min(1, 'Idempotency key không được để trống').optional(),
-  is_test: z.boolean().optional(),
 });
 export type DrawNextRequest = z.infer<typeof DrawNextRequestSchema>;
+
+export const DrawNextResultSchema = z.object({
+  draw: DrawSchema,
+  prize: PrizeSchema,
+  is_idempotent: z.boolean(),
+});
+export type DrawNextResult = z.infer<typeof DrawNextResultSchema>;
 
 export const ConfirmWonRequestSchema = z.object({
   draw_id: z.string().uuid('ID lượt quay không hợp lệ'),
@@ -38,6 +44,10 @@ export type MarkAbsentRequest = z.infer<typeof MarkAbsentRequestSchema>;
 
 export const VoidLastRequestSchema = z.object({
   event_id: z.string().uuid('ID sự kiện không hợp lệ'),
-  is_test: z.boolean().default(false),
 });
 export type VoidLastRequest = z.infer<typeof VoidLastRequestSchema>;
+
+export const ResetEventRequestSchema = z.object({
+  event_id: z.string().uuid('ID sự kiện không hợp lệ'),
+});
+export type ResetEventRequest = z.infer<typeof ResetEventRequestSchema>;
