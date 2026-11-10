@@ -19,8 +19,9 @@ const config: Config = {
         },
       },
       fontFamily: {
-        title: ['Playfair Display', 'Cormorant Garamond', 'serif'],
-        body: ['Be Vietnam Pro', 'sans-serif'],
+        title: ['"Playfair Display"', 'Georgia', 'serif'],
+        body: ['"Be Vietnam Pro"', 'system-ui', 'sans-serif'],
+        mono: ['"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'monospace'],
       },
     },
   },

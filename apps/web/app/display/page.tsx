@@ -5,7 +5,7 @@ import { hasPublicSupabaseEnv } from '@/lib/supabase/env';
 import { fetchActiveDisplayState } from '@/lib/display-state';
 import { LoginForm } from '@/components/auth/LoginForm';
 import { SignOutButton } from '@/components/auth/SignOutButton';
-import { DisplayStage2D } from '@/components/display/DisplayStage2D';
+import { DisplayViewport } from '@/components/display/DisplayViewport';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 
@@ -96,7 +96,7 @@ export default async function DisplayPage({ searchParams }: DisplayPageProps) {
   try {
     const initialState = await fetchActiveDisplayState(isPreview);
     return (
-      <DisplayStage2D
+      <DisplayViewport
         initialState={initialState}
         isPreview={isPreview}
         actorEmail={auth.actor.user.email ?? auth.actor.role}

@@ -14,7 +14,7 @@ Hệ thống quay số may mắn 3D cao cấp dành cho đại hội / lễ hộ
   - Partial Unique Index: Chỉ duy nhất 1 sự kiện được `is_active = true`.
   - Trigger ngăn chặn thay đổi `test_mode` khi sự kiện đã có lượt quay chính thức (`is_test = false`).
   - Phân quyền nghiêm ngặt: `REVOKE EXECUTE FROM PUBLIC, anon, authenticated; GRANT ONLY TO service_role`.
-- **Màn hình sân khấu 3D**: Three.js qua React Three Fiber, Rapier Physics, Bloom effect, GSAP.
+- **Màn hình sân khấu 3D ("Gala of Stained Glass")**: Three.js qua React Three Fiber (`dynamic(..., { ssr: false })` chỉ tách chunk trên `/display`), Rapier Physics (40–50 bóng 0–9 via `CanvasTexture`), Bloom/Vignette (Cao), và chế độ dự phòng 2D tự động khi WebGL không khả dụng / `webglcontextlost`.
 
 ---
 
@@ -29,7 +29,7 @@ church-lucky-draw/
 │  └─ components/three/       # Stage, Cage, Balls, Chute, Chùm sáng, Effects
 ├─ packages/shared/           # Zod schemas, Draw state machine, CSPRNG helpers & Vitest
 ├─ supabase/
-│  ├─ migrations/             # 20261109000001 (Schema, RLS), 20261109000002 (CSPRNG RPCs)
+│  ├─ migrations/             # 000001 (Schema, RLS), 000002 (CSPRNG RPCs), 000003 (activate_event RPC)
 │  ├─ seed.sql                # Dữ liệu mẫu (chỉ dùng cục bộ, không bao giờ push vào remote migration)
 │  └─ tests/                  # Integration test suite kiểm thử DB độc lập
 ├─ turbo.json                 # Cấu hình Turborepo pipeline
@@ -121,9 +121,10 @@ Hỗ trợ cả 2 bộ tên khóa phổ biến của Supabase:
 
 ### 3. Áp dụng Database Migrations với Supabase CLI
 
-Thư mục `supabase/migrations/` chỉ chứa 2 file schema & RPCs chính thức:
+Thư mục `supabase/migrations/` gồm 3 file schema & RPCs chính thức:
 - `20261109000001_initial_schema.sql`: Bảng (`events`, `prizes`, `excluded_tickets`, `draws`, `audit_logs`), `ON DELETE RESTRICT`, `UNIQUE (event_id, is_test, seq)`, Partial Unique Indexes, trigger khóa dải số / vé loại trừ / số lượng giải khi đã có quay chính thức, RLS (`draws` & `audit_logs` chỉ SELECT cho admin), Realtime publication, Storage bucket (chỉ PNG/JPEG/WEBP/Audio, bỏ SVG).
-- `20261109000002_draw_rpcs.sql`: Hàm `draw_next`, `confirm_won`, `mark_absent`, `undo_absent`, `void_last`, `clear_test_draws`, `reset_event` (ghi `audit_logs`), CSPRNG rejection sampling (mọi hàm `SECURITY DEFINER` đều gắn `pg_temp` trong `search_path`).
+- `20261109000002_draw_rpcs.sql`: Hàm `draw_next`, `confirm_won`, `mark_absent`, `undo_absent`, `void_last`, `clear_test_draws`, `reset_event` (ghi `audit_logs` với `actor_id` / `actor_email`), CSPRNG rejection sampling (mọi hàm `SECURITY DEFINER` đều gắn `pg_temp` trong `search_path`).
+- `20261110000003_activate_event_rpc.sql`: Hàm `activate_event` (`service_role` only, khóa advisory transaction) chuyển `is_active = true` sang sự kiện đích một cách nguyên tử (atomic).
 
 File dữ liệu mẫu `supabase/seed.sql` được tách riêng, không nằm trong migrations.
 
@@ -163,3 +164,32 @@ Truy cập:
 - Màn hình sân khấu (Presenter): [http://localhost:3000/display](http://localhost:3000/display)
 - Xem trước chỉ đọc (Admin Preview): [http://localhost:3000/display?preview=1](http://localhost:3000/display?preview=1)
 - Bảng quản trị (Admin): [http://localhost:3000/admin](http://localhost:3000/admin)
+
+---
+
+## 🎭 Phím Tắt & Chế Độ Trình Chiếu (`/display`)
+
+- **`Space` / `→`**: Quay số tiếp theo (tự động khóa trong lúc đang mở số & có cooldown 900ms chống bấm đúp bút trình chiếu).
+- **`Enter`**: Xác nhận vé trúng thưởng (`won`).
+- **`V`**: Đánh dấu vé vắng mặt (`absent`).
+- **`U`**: Hoàn tác vắng mặt lượt cuối (`undo_absent`).
+- **`Backspace`**: Hủy lượt quay cuối & trả số về rổ (`void_last`).
+- **`Q`**: Chuyển nhanh chất lượng đồ họa: **Cao (3D + Transmission + Bloom + 50 bóng)** → **Trung bình (3D + 40 bóng)** → **Thấp (2D an toàn)**.
+- **`D`**: Bật / tắt bảng đo **FPS** trực tiếp.
+- **`M`**: Bật / tắt âm thanh sân khấu (`Howler.js`).
+- **`F`**: Bật / tắt toàn màn hình.
+
+---
+
+## 📦 Bản Quyền Tài Nguyên Tự Lưu Trữ (Fonts & Audio Assets)
+
+Toàn bộ font chữ và tệp âm thanh được lưu trữ cục bộ (không phụ thuộc CDN bên thứ ba khi trình chiếu ngoại tuyến):
+
+- **Typography (Self-hosted via `@fontsource`, chuẩn SIL Open Font License 1.1)**:
+  - `@fontsource/playfair-display` — Tiêu đề trang trọng (OFL-1.1).
+  - `@fontsource/be-vietnam-pro` — Nội dung UI tiếng Việt đầy đủ dấu (OFL-1.1).
+  - `@fontsource/jetbrains-mono` — Số vé & mặt số bóng 3D sắc nét (OFL-1.1).
+- **Audio Effects (`apps/web/public/sounds/`, CC0 1.0 Public Domain / tổng hợp nội bộ bằng script PCM)**:
+  - `unlock-chime.wav` — Hợp âm chuông thánh đường khi bấm *Bấm để bắt đầu* (CC0).
+  - `draw-spin-start.wav` — Hiệu ứng pha lê khởi động lượt quay (CC0).
+  - `ambient-shimmer.wav` — Nhạc nền ambient lặp êm khi chưa tải file nhạc nền riêng của sự kiện (CC0).

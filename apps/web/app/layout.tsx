@@ -1,4 +1,13 @@
 import type { Metadata } from 'next';
+import '@fontsource/be-vietnam-pro/400.css';
+import '@fontsource/be-vietnam-pro/500.css';
+import '@fontsource/be-vietnam-pro/600.css';
+import '@fontsource/be-vietnam-pro/700.css';
+import '@fontsource/playfair-display/600.css';
+import '@fontsource/playfair-display/700.css';
+import '@fontsource/playfair-display/800.css';
+import '@fontsource/jetbrains-mono/700.css';
+import '@fontsource/jetbrains-mono/800.css';
 import './globals.css';
 
 export const metadata: Metadata = {
