@@ -7,21 +7,21 @@ export const BALL_DIGIT_PALETTE: ReadonlyArray<{
   highlight: string;
   shadow: string;
 }> = [
-  { base: '#D4941C', highlight: '#FCE28A', shadow: '#7A4E06' }, // 0: Royal Gold
-  { base: '#9E1B32', highlight: '#E55A73', shadow: '#4B0815' }, // 1: Sacred Burgundy
-  { base: '#1D4ED8', highlight: '#7CA4FF', shadow: '#0E246E' }, // 2: Cathedral Sapphire
-  { base: '#0F766E', highlight: '#52D1C2', shadow: '#063C38' }, // 3: Liturgical Emerald
-  { base: '#6D28D9', highlight: '#B589FA', shadow: '#33106D' }, // 4: Advent Amethyst
-  { base: '#B45309', highlight: '#F6B15C', shadow: '#5B2603' }, // 5: Candlelight Amber
-  { base: '#0369A1', highlight: '#65C2F5', shadow: '#023250' }, // 6: Cerulean
-  { base: '#BE123C', highlight: '#FB7185', shadow: '#5B061D' }, // 7: Crimson Rose
-  { base: '#3730A3', highlight: '#8F88F7', shadow: '#1B1659' }, // 8: Vesper Indigo
-  { base: '#A67C1E', highlight: '#F7DF8E', shadow: '#523C08' }, // 9: Antique Brass
+  { base: '#D98A00', highlight: '#FFCC33', shadow: '#6B3D00' }, // 0: Imperial Gold
+  { base: '#C4082F', highlight: '#F43F5E', shadow: '#4C0313' }, // 1: Ruby Stained Glass
+  { base: '#0D47E5', highlight: '#3B82F6', shadow: '#061B66' }, // 2: Cathedral Sapphire
+  { base: '#058C5B', highlight: '#10B981', shadow: '#023B26' }, // 3: Liturgical Emerald
+  { base: '#701CC2', highlight: '#A855F7', shadow: '#2B0752' }, // 4: Deep Amethyst
+  { base: '#CC5500', highlight: '#F59E0B', shadow: '#541D00' }, // 5: Venetian Amber
+  { base: '#027A8F', highlight: '#06B6D4', shadow: '#013440' }, // 6: Aegean Teal
+  { base: '#B80B5C', highlight: '#EC4899', shadow: '#4A0325' }, // 7: Carmine Rose
+  { base: '#312E9E', highlight: '#6366F1', shadow: '#13114D' }, // 8: Cobalt Indigo
+  { base: '#B91C1C', highlight: '#EF4444', shadow: '#4F0808' }, // 9: Warm Vermilion
 ];
 
 /**
- * Generates an equirectangular ball CanvasTexture with dual opposite medallions
- * displaying the digit clearly from multiple camera angles as balls tumble.
+ * Generates an equirectangular stained-glass jewel ball CanvasTexture with rich
+ * saturated colors, dual gold-trimmed medallions, and high-contrast digit glyphs.
  */
 export function createBallDigitTexture(digit: number): THREE.CanvasTexture {
   const safeDigit = ((digit % 10) + 10) % 10;
@@ -34,59 +34,64 @@ export function createBallDigitTexture(digit: number): THREE.CanvasTexture {
   const ctx = canvas.getContext('2d');
 
   if (ctx) {
-    // Rich spherical-friendly gradient body
+    // Rich saturated jewel glass body (deep tones prevent milky pastel wash under bright light)
     const bgGrad = ctx.createLinearGradient(0, 0, 0, size);
     bgGrad.addColorStop(0, palette.highlight);
-    bgGrad.addColorStop(0.5, palette.base);
+    bgGrad.addColorStop(0.28, palette.base);
+    bgGrad.addColorStop(0.75, palette.base);
     bgGrad.addColorStop(1, palette.shadow);
     ctx.fillStyle = bgGrad;
     ctx.fillRect(0, 0, size, size);
 
-    // Subtle metallic equatorial band
-    ctx.fillStyle = 'rgba(255, 240, 195, 0.22)';
-    ctx.fillRect(0, size * 0.43, size, size * 0.14);
-    ctx.strokeStyle = 'rgba(255, 232, 165, 0.55)';
-    ctx.lineWidth = 2;
+    // Subtle dark jewel depth vignetting along seam band without milky white opacity
+    ctx.fillStyle = 'rgba(10, 12, 28, 0.14)';
+    ctx.fillRect(0, size * 0.44, size, size * 0.12);
+
+    // Sleek fine metallic gold pinstripe border lines
+    ctx.strokeStyle = 'rgba(248, 206, 98, 0.78)';
+    ctx.lineWidth = 2.2;
     ctx.beginPath();
-    ctx.moveTo(0, size * 0.43);
-    ctx.lineTo(size, size * 0.43);
-    ctx.moveTo(0, size * 0.57);
-    ctx.lineTo(size, size * 0.57);
+    ctx.moveTo(0, size * 0.44);
+    ctx.lineTo(size, size * 0.44);
+    ctx.moveTo(0, size * 0.56);
+    ctx.lineTo(size, size * 0.56);
     ctx.stroke();
 
-    // Draw two clean opposite medallions at u=0.25 and u=0.75 (x=64, x=192)
+    // Compact dual opposite number medallions (u=0.25 and u=0.75) so >85% stays vivid jewel color
     const centers = [size * 0.25, size * 0.75];
     for (const cx of centers) {
       const cy = size * 0.5;
-      const radius = size * 0.17;
+      const radius = size * 0.132;
 
-      // Outer gold trim ring
+      // Outer luminous gold ring
       ctx.beginPath();
       ctx.arc(cx, cy, radius + 3.5, 0, Math.PI * 2);
       ctx.fillStyle = '#F5C451';
       ctx.fill();
 
-      // Cream ivory medallion center
+      // Warm ivory glass medallion core
       ctx.beginPath();
       ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-      ctx.fillStyle = '#FFF9E8';
+      ctx.fillStyle = '#FFF6DC';
       ctx.fill();
 
-      // Subtle inner ring
+      // Inner jewel accent hairline
       ctx.beginPath();
-      ctx.arc(cx, cy, radius - 4, 0, Math.PI * 2);
-      ctx.strokeStyle = 'rgba(180, 125, 30, 0.45)';
+      ctx.arc(cx, cy, radius - 3.2, 0, Math.PI * 2);
+      ctx.strokeStyle = palette.shadow;
+      ctx.globalAlpha = 0.45;
       ctx.lineWidth = 1.5;
       ctx.stroke();
+      ctx.globalAlpha = 1;
 
-      // High-contrast digit numeral (squashed horizontally ~0.62x to counter equirectangular stretch)
+      // High-contrast digit numeral (horizontally squashed to counter equirectangular UV stretch)
       ctx.save();
-      ctx.translate(cx, cy + 2);
-      ctx.scale(0.68, 1);
-      ctx.font = '800 56px "JetBrains Mono", "Be Vietnam Pro", monospace';
+      ctx.translate(cx, cy + 1.5);
+      ctx.scale(0.66, 1);
+      ctx.font = '800 46px "JetBrains Mono", "Be Vietnam Pro", monospace';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillStyle = '#0B1230';
+      ctx.fillStyle = '#080D23';
       ctx.fillText(String(safeDigit), 0, 0);
       ctx.restore();
     }
@@ -172,7 +177,7 @@ export function createSlotDigitTexture(
 }
 
 /**
- * Generates a soft warm radial glow sprite for floating atmospheric gold dust.
+ * Generates a soft warm radial glow sprite for floating atmospheric gold dust and bursts.
  */
 export function createGoldDustTexture(): THREE.CanvasTexture {
   const size = 64;

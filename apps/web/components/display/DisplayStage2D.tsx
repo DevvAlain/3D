@@ -50,6 +50,7 @@ export function DisplayStage2D({ controller }: DisplayStage2DProps) {
     ? formatTicket(currentDraw.ticket, digits)
     : ''.padStart(digits, '•');
   const digitChars = formattedTicket.split('');
+  const showWinnerCallout = Boolean(currentDraw && !isAnimating && revealedDigits >= digits);
 
   return (
     <DisplayStageChrome controller={controller} variant="2d">
@@ -96,13 +97,26 @@ export function DisplayStage2D({ controller }: DisplayStage2DProps) {
               })}
             </div>
 
-            <p className="mt-5 text-sm text-parish-cream/70">
-              {currentDraw
-                ? isAnimating
-                  ? 'Đang lần lượt mở từng chữ số (chờ hoàn tất trước khi bấm)...'
-                  : 'Số vé trúng thưởng đã hiển thị đầy đủ — mời Presenter xác nhận kết quả'
-                : `Còn ${state.validTicketsRemaining.toLocaleString('vi-VN')} / ${state.totalPoolSize.toLocaleString('vi-VN')} vé hợp lệ trong rổ quay`}
-            </p>
+            {showWinnerCallout && currentDraw ? (
+              <div
+                data-testid="winner-invitation-banner-2d"
+                className="mt-5 rounded-2xl border-2 border-parish-gold bg-parish-gold/15 px-5 py-2.5 text-center shadow-[0_0_30px_rgba(245,196,81,0.35)]"
+              >
+                <p className="font-title text-lg font-extrabold text-parish-goldLight sm:text-xl">
+                  Mời người giữ vé số{' '}
+                  <span className="mx-1 font-mono text-white">{formattedTicket}</span>{' '}
+                  lên nhận thưởng
+                </p>
+              </div>
+            ) : (
+              <p className="mt-5 text-sm text-parish-cream/70">
+                {currentDraw
+                  ? isAnimating
+                    ? 'Đang lần lượt mở từng chữ số (nhấn Space để mở ngay toàn bộ số)...'
+                    : 'Số vé trúng thưởng đã hiển thị đầy đủ'
+                  : `Còn ${state.validTicketsRemaining.toLocaleString('vi-VN')} / ${state.totalPoolSize.toLocaleString('vi-VN')} vé hợp lệ trong rổ quay`}
+              </p>
+            )}
           </div>
 
           {/* Presenter Action Bar */}
@@ -150,7 +164,7 @@ export function DisplayStage2D({ controller }: DisplayStage2DProps) {
                 ) : isAnimating ? (
                   <Button size="lg" variant="secondary" onClick={skipRevealAnimation}>
                     <FastForward className="h-5 w-5" />
-                    Hiển thị ngay toàn bộ số
+                    Mở ngay tất cả số (Space)
                   </Button>
                 ) : (
                   <>

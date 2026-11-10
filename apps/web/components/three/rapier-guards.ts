@@ -1,4 +1,4 @@
-export const CAGE_CENTER: [number, number, number] = [0, 1.18, 0];
+export const CAGE_CENTER: [number, number, number] = [0, 1.24, 0];
 export const CAGE_RADIUS = 1.48;
 export const WALL_THICKNESS = 0.36;
 export const CAGE_BOUNDARY_RADIUS = 1.72;

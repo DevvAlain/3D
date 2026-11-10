@@ -13,3 +13,23 @@ body {
   font-family: 'Be Vietnam Pro', system-ui, -apple-system, sans-serif;
   overflow-x: hidden;
 }
+
+@keyframes parishCreditsScroll {
+  0%,
+  8% {
+    transform: translateY(0%);
+  }
+  100% {
+    transform: translateY(-50%);
+  }
+}
+
+.parish-credits-track {
+  animation: parishCreditsScroll var(--credits-duration, 28s) linear infinite;
+  will-change: transform;
+}
+
+.parish-credits-track.parish-credits-paused,
+.parish-credits-viewport:hover .parish-credits-track {
+  animation-play-state: paused;
+}

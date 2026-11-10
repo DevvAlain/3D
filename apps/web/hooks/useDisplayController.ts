@@ -7,9 +7,15 @@ import {
   type Draw,
   type DrawNextResult,
   type Prize,
+  type PrizeProgress,
 } from '@church/shared';
 import { resolveDrawNextClientTransition } from '@/lib/display-state';
 import { DisplaySoundEngine } from '@/lib/sound-engine';
+import {
+  computeRevealSchedule,
+  evaluateRevealTimeline,
+  type RevealTimelineSnapshot,
+} from '@/lib/reveal-timeline';
 
 export type DisplayQualityPreset = 'high' | 'medium' | 'low';
 
@@ -32,19 +38,23 @@ export function shouldIgnoreStageKeyboardAction(params: {
   const { code, key, isAnimating, isSubmitting, inCooldown, repeat } = params;
   if (repeat || isSubmitting || inCooldown) return true;
 
-  // Never allow Space / ArrowRight / Enter (or V / U / Backspace) to trigger actions while animation runs
-  const isDrawOrConfirmKey =
-    code === 'Space' ||
-    code === 'ArrowRight' ||
-    code === 'Enter' ||
-    key === 'v' ||
-    key === 'V' ||
-    key === 'u' ||
-    key === 'U' ||
-    code === 'Backspace';
-
-  if (isDrawOrConfirmKey && isAnimating) {
-    return true;
+  // During an active reveal animation, ONLY Space (fast-forward) is permitted;
+  // ArrowRight, Enter, V, U, and Backspace stay strictly locked.
+  if (isAnimating) {
+    if (code === 'Space') {
+      return false;
+    }
+    if (
+      code === 'ArrowRight' ||
+      code === 'Enter' ||
+      key === 'v' ||
+      key === 'V' ||
+      key === 'u' ||
+      key === 'U' ||
+      code === 'Backspace'
+    ) {
+      return true;
+    }
   }
 
   return false;
@@ -128,6 +138,52 @@ export interface DisplayNotice {
   text: string;
 }
 
+export interface BetweenPrizesTransition {
+  completedPrize: PrizeProgress;
+  nextPrize: PrizeProgress;
+  winners: DisplayStatePayload['wonDraws'];
+}
+
+function buildIdleSnapshot(digits: number, restoredReveal: boolean): RevealTimelineSnapshot {
+  if (restoredReveal) {
+    const schedule = computeRevealSchedule(digits);
+    return {
+      digits: schedule.digits,
+      elapsedSec: schedule.totalDurationSec,
+      totalDurationSec: schedule.totalDurationSec,
+      finalRevealAtSec: schedule.finalRevealAtSec,
+      phase: 'complete',
+      revealedDigits: schedule.digits,
+      justLandedDigitIndex: null,
+      activeBall: null,
+      cageSpeedMultiplier: 1.0,
+      stageDimFactor: 0,
+      slotHighlightIndex: null,
+      suspenseTickStep: 0,
+      finalBurstStrength: 0,
+      isFinalRevealVisible: true,
+      isComplete: true,
+    };
+  }
+  return {
+    digits,
+    elapsedSec: 0,
+    totalDurationSec: computeRevealSchedule(digits).totalDurationSec,
+    finalRevealAtSec: computeRevealSchedule(digits).finalRevealAtSec,
+    phase: 'idle',
+    revealedDigits: 0,
+    justLandedDigitIndex: null,
+    activeBall: null,
+    cageSpeedMultiplier: 1.0,
+    stageDimFactor: 0,
+    slotHighlightIndex: null,
+    suspenseTickStep: 0,
+    finalBurstStrength: 0,
+    isFinalRevealVisible: false,
+    isComplete: false,
+  };
+}
+
 export interface DisplayController {
   state: DisplayStatePayload;
   isPreview: boolean;
@@ -136,6 +192,12 @@ export interface DisplayController {
   unlockStage: () => void;
   revealedDigits: number;
   isAnimating: boolean;
+  isFinalRevealVisible: boolean;
+  activeRevealTicketDigits: number[];
+  revealTimelineRef: React.MutableRefObject<RevealTimelineSnapshot>;
+  confettiBurstKey: number;
+  betweenPrizes: BetweenPrizesTransition | null;
+  dismissBetweenPrizes: () => void;
   submittingAction: string | null;
   isInCooldown: boolean;
   connectionStatus: 'online' | 'syncing' | 'offline';
@@ -154,7 +216,7 @@ export interface DisplayController {
   toggleShowFps: () => void;
   muted: boolean;
   toggleMuted: () => void;
-  refreshState: () => Promise<void>;
+  refreshState: () => Promise<DisplayStatePayload | null>;
   skipRevealAnimation: () => void;
   handleDrawNext: () => Promise<void>;
   handleConfirmWon: () => Promise<void>;
@@ -174,12 +236,17 @@ export function useDisplayController(params: {
 }): DisplayController {
   const { initialState, isPreview, actorEmail } = params;
 
+  const initialDigits = initialState.event?.digits ?? 5;
+  const hasRestoredReveal = Boolean(initialState.currentDraw && initialState.event);
+
   const [state, setState] = React.useState<DisplayStatePayload>(initialState);
   const [stageUnlocked, setStageUnlocked] = React.useState<boolean>(isPreview);
   const [revealedDigits, setRevealedDigits] = React.useState<number>(() =>
-    initialState.currentDraw && initialState.event ? initialState.event.digits : 0
+    hasRestoredReveal ? initialDigits : 0
   );
   const [isAnimating, setIsAnimating] = React.useState<boolean>(false);
+  const [confettiBurstKey, setConfettiBurstKey] = React.useState<number>(0);
+  const [betweenPrizes, setBetweenPrizes] = React.useState<BetweenPrizesTransition | null>(null);
   const [submittingAction, setSubmittingAction] = React.useState<string | null>(null);
   const [isInCooldown, setIsInCooldown] = React.useState<boolean>(false);
   const [connectionStatus, setConnectionStatus] = React.useState<'online' | 'syncing' | 'offline'>(
@@ -188,14 +255,24 @@ export function useDisplayController(params: {
   const [notice, setNotice] = React.useState<DisplayNotice | null>(null);
   const [isFullscreen, setIsFullscreen] = React.useState(false);
 
-  const [quality, setQualityState] = React.useState<DisplayQualityPreset>('high');
+  // Default to "Trung bình (3D)" until automated FPS benchmarking is added
+  const [quality, setQualityState] = React.useState<DisplayQualityPreset>('medium');
   const [webglSupported, setWebglSupported] = React.useState<boolean>(true);
   const [webglContextLost, setWebglContextLost] = React.useState<boolean>(false);
   const [showFps, setShowFps] = React.useState<boolean>(false);
   const [muted, setMuted] = React.useState<boolean>(false);
 
   const pendingDrawKeyRef = React.useRef<string | null>(null);
-  const animationTimerRef = React.useRef<number | null>(null);
+  const activeDrawIdRef = React.useRef<string | null>(initialState.currentDraw?.id ?? null);
+  const rafIdRef = React.useRef<number | null>(null);
+  const burstTailRafRef = React.useRef<number | null>(null);
+  const revealStartMsRef = React.useRef<number>(0);
+  const lastReportedDigitsRef = React.useRef<number>(hasRestoredReveal ? initialDigits : 0);
+  const lastSuspenseTickRef = React.useRef<number>(0);
+  const finaleTriggeredRef = React.useRef<boolean>(hasRestoredReveal);
+  const revealTimelineRef = React.useRef<RevealTimelineSnapshot>(
+    buildIdleSnapshot(initialDigits, hasRestoredReveal)
+  );
   const isAnimatingRef = React.useRef<boolean>(false);
   const submittingRef = React.useRef<string | null>(null);
   const cooldownUntilRef = React.useRef<number>(0);
@@ -207,6 +284,17 @@ export function useDisplayController(params: {
   const currentDraw = state.currentDraw;
   const latestDraw = state.latestDraw;
   const activePrize = state.activePrize;
+
+  const cancelAllAnimationLoops = React.useCallback(() => {
+    if (rafIdRef.current !== null) {
+      window.cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+    if (burstTailRafRef.current !== null) {
+      window.cancelAnimationFrame(burstTailRafRef.current);
+      burstTailRafRef.current = null;
+    }
+  }, []);
 
   // Detect WebGL & load preferred quality preset on mount
   React.useEffect(() => {
@@ -226,12 +314,12 @@ export function useDisplayController(params: {
     soundEngineRef.current = engine;
 
     return () => {
+      cancelAllAnimationLoops();
       engine.dispose();
       soundEngineRef.current = null;
-      if (animationTimerRef.current !== null) window.clearInterval(animationTimerRef.current);
       if (cooldownTimerRef.current !== null) window.clearTimeout(cooldownTimerRef.current);
     };
-  }, []);
+  }, [cancelAllAnimationLoops]);
 
   React.useEffect(() => {
     if (stageUnlocked) {
@@ -297,73 +385,156 @@ export function useDisplayController(params: {
     soundEngineRef.current?.unlock(event?.bg_music_url ?? null);
   }, [event?.bg_music_url]);
 
-  const stopRevealAnimation = React.useCallback((totalDigits: number) => {
-    if (animationTimerRef.current !== null) {
-      window.clearInterval(animationTimerRef.current);
-      animationTimerRef.current = null;
-    }
-    isAnimatingRef.current = false;
-    setRevealedDigits(totalDigits);
-    setIsAnimating(false);
+  const dismissBetweenPrizes = React.useCallback(() => {
+    setBetweenPrizes(null);
   }, []);
 
-  const skipRevealAnimation = React.useCallback(() => {
-    stopRevealAnimation(digits);
-  }, [stopRevealAnimation, digits]);
-
-  const startRevealAnimation = React.useCallback((totalDigits: number) => {
-    if (animationTimerRef.current !== null) {
-      window.clearInterval(animationTimerRef.current);
-      animationTimerRef.current = null;
-    }
-    isAnimatingRef.current = true;
-    setRevealedDigits(0);
-    setIsAnimating(true);
-
-    let step = 0;
-    animationTimerRef.current = window.setInterval(() => {
-      step += 1;
-      setRevealedDigits(step);
-      if (step >= totalDigits) {
-        if (animationTimerRef.current !== null) {
-          window.clearInterval(animationTimerRef.current);
-          animationTimerRef.current = null;
-        }
-        isAnimatingRef.current = false;
-        setIsAnimating(false);
+  const startBurstTail = React.useCallback((totalDigits: number, startOffsetSec: number) => {
+    const startMs = performance.now();
+    const runTailFrame = () => {
+      const elapsedTail = (performance.now() - startMs) / 1000;
+      const snap = evaluateRevealTimeline(totalDigits, startOffsetSec + elapsedTail);
+      revealTimelineRef.current = snap;
+      if (!snap.isComplete) {
+        burstTailRafRef.current = window.requestAnimationFrame(runTailFrame);
+      } else {
+        burstTailRafRef.current = null;
       }
-    }, 450);
+    };
+    revealTimelineRef.current = evaluateRevealTimeline(totalDigits, startOffsetSec);
+    burstTailRafRef.current = window.requestAnimationFrame(runTailFrame);
   }, []);
+
+  const stopRevealAnimation = React.useCallback(
+    (totalDigits: number, restoredReveal: boolean) => {
+      cancelAllAnimationLoops();
+      soundEngineRef.current?.stopDrumRoll();
+      isAnimatingRef.current = false;
+      lastReportedDigitsRef.current = restoredReveal ? totalDigits : 0;
+      lastSuspenseTickRef.current = 0;
+      finaleTriggeredRef.current = restoredReveal;
+      revealTimelineRef.current = buildIdleSnapshot(totalDigits, restoredReveal);
+      setRevealedDigits(restoredReveal ? totalDigits : 0);
+      setIsAnimating(false);
+    },
+    [cancelAllAnimationLoops]
+  );
+
+  // One-key (Space) fast-forward straight to finished reveal + celebratory burst & fanfare
+  const skipRevealAnimation = React.useCallback(() => {
+    if (!isAnimatingRef.current) return;
+    cancelAllAnimationLoops();
+
+    const schedule = computeRevealSchedule(digits);
+    isAnimatingRef.current = false;
+    lastReportedDigitsRef.current = digits;
+    setRevealedDigits(digits);
+    setIsAnimating(false);
+
+    if (!finaleTriggeredRef.current) {
+      finaleTriggeredRef.current = true;
+      soundEngineRef.current?.playTing();
+      soundEngineRef.current?.playFanfare();
+      setConfettiBurstKey((k) => k + 1);
+    } else {
+      soundEngineRef.current?.stopDrumRoll();
+    }
+
+    startBurstTail(digits, schedule.finalRevealAtSec);
+    beginCooldown();
+  }, [digits, cancelAllAnimationLoops, startBurstTail, beginCooldown]);
+
+  const startRevealAnimation = React.useCallback(
+    (totalDigits: number) => {
+      cancelAllAnimationLoops();
+      isAnimatingRef.current = true;
+      lastReportedDigitsRef.current = 0;
+      lastSuspenseTickRef.current = 0;
+      finaleTriggeredRef.current = false;
+      revealStartMsRef.current = performance.now();
+      revealTimelineRef.current = evaluateRevealTimeline(totalDigits, 0);
+
+      setRevealedDigits(0);
+      setIsAnimating(true);
+      soundEngineRef.current?.startDrumRoll(0.3);
+
+      const stepFrame = () => {
+        const elapsedSec = (performance.now() - revealStartMsRef.current) / 1000;
+        const snap = evaluateRevealTimeline(totalDigits, elapsedSec);
+        revealTimelineRef.current = snap;
+
+        if (snap.phase === 'final-suspense') {
+          soundEngineRef.current?.setDrumRollVolume(0.42);
+          if (snap.suspenseTickStep > lastSuspenseTickRef.current) {
+            lastSuspenseTickRef.current = snap.suspenseTickStep;
+            soundEngineRef.current?.playTick();
+          }
+        }
+
+        if (snap.isFinalRevealVisible) {
+          rafIdRef.current = null;
+          isAnimatingRef.current = false;
+          lastReportedDigitsRef.current = totalDigits;
+          finaleTriggeredRef.current = true;
+          setRevealedDigits(totalDigits);
+          setIsAnimating(false);
+          soundEngineRef.current?.playTing();
+          soundEngineRef.current?.playFanfare();
+          setConfettiBurstKey((k) => k + 1);
+          startBurstTail(totalDigits, snap.elapsedSec);
+          return;
+        }
+
+        if (snap.revealedDigits > lastReportedDigitsRef.current) {
+          lastReportedDigitsRef.current = snap.revealedDigits;
+          setRevealedDigits(snap.revealedDigits);
+          soundEngineRef.current?.playTing();
+        }
+
+        rafIdRef.current = window.requestAnimationFrame(stepFrame);
+      };
+
+      rafIdRef.current = window.requestAnimationFrame(stepFrame);
+    },
+    [cancelAllAnimationLoops, startBurstTail]
+  );
 
   // Poll /api/display/state every 4s (ZERO Supabase Realtime on /display)
-  const refreshState = React.useCallback(async () => {
+  const refreshState = React.useCallback(async (): Promise<DisplayStatePayload | null> => {
     try {
       setConnectionStatus((prev) => (prev === 'offline' ? 'offline' : 'syncing'));
       const url = isPreview ? '/api/display/state?preview=1' : '/api/display/state';
       const res = await fetch(url, { cache: 'no-store' });
       if (!res.ok) {
         setConnectionStatus('offline');
-        return;
+        return null;
       }
       const nextState = (await res.json()) as DisplayStatePayload;
-      setState(nextState);
       setConnectionStatus('online');
 
-      if (nextState.currentDraw && nextState.event && !isAnimatingRef.current) {
-        setRevealedDigits(nextState.event.digits);
-      } else if (!nextState.currentDraw) {
-        if (animationTimerRef.current !== null) {
-          window.clearInterval(animationTimerRef.current);
-          animationTimerRef.current = null;
-        }
-        isAnimatingRef.current = false;
-        setIsAnimating(false);
-        setRevealedDigits(0);
+      // Guard against mid-flight `/api/draw/next` or active animation so numbers NEVER flash
+      if (submittingRef.current === 'next' || isAnimatingRef.current) {
+        return nextState;
       }
+
+      setState(nextState);
+
+      if (nextState.currentDraw && nextState.event) {
+        if (nextState.currentDraw.id !== activeDrawIdRef.current) {
+          activeDrawIdRef.current = nextState.currentDraw.id;
+          stopRevealAnimation(nextState.event.digits, true);
+        }
+      } else if (activeDrawIdRef.current !== null || burstTailRafRef.current === null) {
+        activeDrawIdRef.current = null;
+        stopRevealAnimation(nextState.event?.digits ?? digits, false);
+      }
+
+      return nextState;
     } catch {
       setConnectionStatus('offline');
+      return null;
     }
-  }, [isPreview]);
+  }, [isPreview, digits, stopRevealAnimation]);
 
   React.useEffect(() => {
     const id = window.setInterval(() => {
@@ -402,7 +573,8 @@ export function useDisplayController(params: {
       return;
     }
 
-    // Allocate ONE idempotency key per logical click and reuse across retries
+    setBetweenPrizes(null);
+
     if (!pendingDrawKeyRef.current) {
       pendingDrawKeyRef.current = crypto.randomUUID();
     }
@@ -442,8 +614,6 @@ export function useDisplayController(params: {
 
       const result = json as unknown as DrawNextResult;
       const transition = resolveDrawNextClientTransition(result);
-
-      // Server confirmed — discard click key so next round generates a fresh key
       pendingDrawKeyRef.current = null;
 
       if (transition.shouldRestoreOnly) {
@@ -453,6 +623,11 @@ export function useDisplayController(params: {
         await refreshState();
         return;
       }
+
+      // Start masked animation timeline synchronously BEFORE placing draw ticket in state
+      activeDrawIdRef.current = result.draw.id;
+      startRevealAnimation(digits);
+      soundEngineRef.current?.playSpinStart();
 
       const revealingWithPrize: Draw & { prize?: Prize } = {
         ...result.draw,
@@ -466,8 +641,6 @@ export function useDisplayController(params: {
       if (transition.noticeMessage) {
         setNotice({ type: 'info', text: transition.noticeMessage });
       }
-      soundEngineRef.current?.playSpinStart();
-      startRevealAnimation(digits);
     } finally {
       submittingRef.current = null;
       setSubmittingAction(null);
@@ -495,6 +668,8 @@ export function useDisplayController(params: {
       return;
     }
 
+    const previousPrize = state.prizes.find((p) => p.id === currentDraw.prize_id) ?? activePrize;
+
     submittingRef.current = 'confirm';
     setSubmittingAction('confirm');
     setNotice(null);
@@ -510,11 +685,32 @@ export function useDisplayController(params: {
         await refreshState();
         return;
       }
-      setNotice({
-        type: 'success',
-        text: `Chúc mừng vé ${formatTicket(currentDraw.ticket, digits)} đã trúng ${currentDraw.prize?.name ?? 'giải thưởng'}!`,
-      });
-      await refreshState();
+
+      const nextState = await refreshState();
+      if (
+        previousPrize &&
+        nextState &&
+        !nextState.isAllPrizesCompleted &&
+        nextState.activePrize &&
+        nextState.activePrize.id !== previousPrize.id
+      ) {
+        const updatedCompleted =
+          nextState.prizes.find((p) => p.id === previousPrize.id) ?? {
+            ...previousPrize,
+            won_count: previousPrize.quantity,
+            remaining_count: 0,
+          };
+        setBetweenPrizes({
+          completedPrize: updatedCompleted,
+          nextPrize: nextState.activePrize,
+          winners: nextState.wonDraws.filter((w) => w.prize_id === previousPrize.id),
+        });
+      } else {
+        setNotice({
+          type: 'success',
+          text: `Đã xác nhận vé ${formatTicket(currentDraw.ticket, digits)} trúng ${currentDraw.prize?.name ?? 'giải thưởng'}!`,
+        });
+      }
     } catch {
       setNotice({ type: 'error', text: 'Lỗi kết nối khi xác nhận trúng thưởng.' });
     } finally {
@@ -522,7 +718,15 @@ export function useDisplayController(params: {
       setSubmittingAction(null);
       beginCooldown();
     }
-  }, [isPreview, currentDraw, digits, refreshState, beginCooldown]);
+  }, [
+    isPreview,
+    currentDraw,
+    state.prizes,
+    activePrize,
+    digits,
+    refreshState,
+    beginCooldown,
+  ]);
 
   const handleMarkAbsent = React.useCallback(async () => {
     if (
@@ -627,6 +831,7 @@ export function useDisplayController(params: {
       return;
     }
 
+    setBetweenPrizes(null);
     submittingRef.current = 'void-last';
     setSubmittingAction('void-last');
     setNotice(null);
@@ -656,7 +861,7 @@ export function useDisplayController(params: {
     }
   }, [isPreview, event?.id, latestDraw, digits, refreshState, beginCooldown]);
 
-  // Keyboard shortcuts (ignore Space / ArrowRight / Enter during animation + cooldown guard)
+  // Keyboard shortcuts (Space fast-forwards during animation, arrows/Enter stay locked during animation)
   React.useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       const tag = (e.target as HTMLElement | null)?.tagName;
@@ -687,6 +892,14 @@ export function useDisplayController(params: {
 
       if (isPreview || !stageUnlocked) return;
 
+      // Pressing Space / Enter / ArrowRight on between-prizes screen advances smoothly to idle stage
+      if (betweenPrizes && (e.code === 'Space' || e.code === 'Enter' || e.code === 'ArrowRight')) {
+        e.preventDefault();
+        setBetweenPrizes(null);
+        beginCooldown();
+        return;
+      }
+
       const blocked = shouldIgnoreStageKeyboardAction({
         key: e.key,
         code: e.code,
@@ -703,18 +916,27 @@ export function useDisplayController(params: {
         return;
       }
 
-      if (e.code === 'Space' || e.code === 'ArrowRight') {
+      if (e.code === 'Space') {
+        e.preventDefault();
+        if (isAnimatingRef.current) {
+          skipRevealAnimation();
+          return;
+        }
+        if (!currentDraw && !state.isAllPrizesCompleted && activePrize) {
+          void handleDrawNext();
+        }
+      } else if (e.code === 'ArrowRight') {
         e.preventDefault();
         if (!currentDraw && !state.isAllPrizesCompleted && activePrize) {
           void handleDrawNext();
         }
       } else if (e.code === 'Enter') {
-        if (currentDraw) {
+        if (currentDraw && !isAnimatingRef.current) {
           e.preventDefault();
           void handleConfirmWon();
         }
       } else if (e.key === 'v' || e.key === 'V') {
-        if (currentDraw) {
+        if (currentDraw && !isAnimatingRef.current) {
           e.preventDefault();
           void handleMarkAbsent();
         }
@@ -724,7 +946,11 @@ export function useDisplayController(params: {
           void handleUndoAbsent();
         }
       } else if (e.code === 'Backspace') {
-        if (latestDraw && (latestDraw.status === 'revealing' || latestDraw.status === 'won')) {
+        if (
+          !isAnimatingRef.current &&
+          latestDraw &&
+          (latestDraw.status === 'revealing' || latestDraw.status === 'won')
+        ) {
           e.preventDefault();
           void handleVoidLast();
         }
@@ -736,6 +962,7 @@ export function useDisplayController(params: {
   }, [
     isPreview,
     stageUnlocked,
+    betweenPrizes,
     currentDraw,
     latestDraw,
     activePrize,
@@ -744,6 +971,8 @@ export function useDisplayController(params: {
     toggleShowFps,
     toggleFullscreen,
     toggleMuted,
+    beginCooldown,
+    skipRevealAnimation,
     handleDrawNext,
     handleConfirmWon,
     handleMarkAbsent,
@@ -758,6 +987,14 @@ export function useDisplayController(params: {
     }));
   }, [state.prizes, state.wonDraws]);
 
+  const activeRevealTicketDigits = React.useMemo(() => {
+    if (!currentDraw || !event) return [];
+    return formatTicket(currentDraw.ticket, event.digits)
+      .split('')
+      .map((ch) => Number(ch));
+  }, [currentDraw, event]);
+
+  const isFinalRevealVisible = Boolean(currentDraw && !isAnimating && revealedDigits >= digits);
   const shouldRender3D = webglSupported && !webglContextLost && quality !== 'low';
 
   return {
@@ -768,6 +1005,12 @@ export function useDisplayController(params: {
     unlockStage,
     revealedDigits,
     isAnimating,
+    isFinalRevealVisible,
+    activeRevealTicketDigits,
+    revealTimelineRef,
+    confettiBurstKey,
+    betweenPrizes,
+    dismissBetweenPrizes,
     submittingAction,
     isInCooldown,
     connectionStatus,

@@ -5,11 +5,13 @@ import * as THREE from 'three';
 import { useFrame } from '@react-three/fiber';
 import { MeshReflectorMaterial } from '@react-three/drei';
 import type { DisplayQualityPreset } from '@/hooks/useDisplayController';
+import type { RevealTimelineSnapshot } from '@/lib/reveal-timeline';
 import { createGoldDustTexture } from '@/components/three/textures';
 
 interface StainedGlassBackdropProps {
   quality: DisplayQualityPreset;
   primaryColor: string;
+  revealTimelineRef: React.MutableRefObject<RevealTimelineSnapshot>;
 }
 
 const PETAL_COLORS = [
@@ -23,9 +25,14 @@ const PETAL_COLORS = [
 
 const CURTAIN_PLEAT_OFFSETS = [-1.45, -0.95, -0.45, 0.05, 0.55, 1.05];
 
-export function StainedGlassBackdrop({ quality, primaryColor }: StainedGlassBackdropProps) {
+export function StainedGlassBackdrop({
+  quality,
+  primaryColor,
+  revealTimelineRef,
+}: StainedGlassBackdropProps) {
   const dustRef = React.useRef<THREE.Points>(null);
   const roseGlowRef = React.useRef<THREE.Mesh>(null);
+  const roseGroupRef = React.useRef<THREE.Group>(null);
   const leftCurtainRef = React.useRef<THREE.Group>(null);
   const rightCurtainRef = React.useRef<THREE.Group>(null);
 
@@ -79,10 +86,31 @@ export function StainedGlassBackdrop({ quality, primaryColor }: StainedGlassBack
   useFrame((state, delta) => {
     const t = state.clock.elapsedTime;
     const clampedDelta = Math.min(delta, 0.05);
+    const { stageDimFactor, finalBurstStrength } = revealTimelineRef.current;
+    const dimScale = Math.max(0.18, 1 - stageDimFactor * 0.78) + finalBurstStrength * 0.55;
 
     if (roseGlowRef.current) {
       const mat = roseGlowRef.current.material as THREE.MeshBasicMaterial;
-      mat.opacity = 0.26 + Math.sin(t * 0.9) * 0.04;
+      const targetOpacity = (0.26 + Math.sin(t * 0.9) * 0.04) * dimScale;
+      mat.opacity = THREE.MathUtils.lerp(mat.opacity, targetOpacity, 1 - Math.exp(-7 * clampedDelta));
+    }
+
+    if (roseGroupRef.current) {
+      roseGroupRef.current.traverse((obj) => {
+        if (obj instanceof THREE.Mesh && obj.material instanceof THREE.MeshStandardMaterial) {
+          if (obj.material.userData.baseEmissive === undefined) {
+            obj.material.userData.baseEmissive = obj.material.emissiveIntensity;
+          }
+          const base = Number(obj.material.userData.baseEmissive) || 0;
+          if (base > 0) {
+            obj.material.emissiveIntensity = THREE.MathUtils.lerp(
+              obj.material.emissiveIntensity,
+              base * dimScale,
+              1 - Math.exp(-7 * clampedDelta)
+            );
+          }
+        }
+      });
     }
 
     if (leftCurtainRef.current) {
@@ -146,7 +174,7 @@ export function StainedGlassBackdrop({ quality, primaryColor }: StainedGlassBack
       </mesh>
 
       {/* Cathedral Rose Window Backdrop (z = -5.6) */}
-      <group position={[0, 2.35, -5.6]}>
+      <group ref={roseGroupRef} position={[0, 2.35, -5.6]}>
         {/* Back sanctuary halo behind rose glass */}
         <mesh ref={roseGlowRef} position={[0, 0, -0.25]}>
           <circleGeometry args={[4.85, 48]} />
@@ -248,9 +276,13 @@ export function StainedGlassBackdrop({ quality, primaryColor }: StainedGlassBack
             />
           </mesh>
         ))}
-        {/* Gold Rope Tieback */}
-        <mesh position={[-0.2, -0.35, 0.35]} rotation={[Math.PI / 2.2, 0, 0.1]}>
-          <torusGeometry args={[1.15, 0.06, 10, 24, Math.PI]} />
+        {/* Snug Gold Braided Sash Collar hugging curtain pleats */}
+        <mesh
+          position={[-0.2, -0.45, 0.02]}
+          rotation={[Math.PI / 2 - 0.12, 0, 0.04]}
+          scale={[1.48, 0.42, 1]}
+        >
+          <torusGeometry args={[1.02, 0.055, 10, 32]} />
           <meshStandardMaterial color="#E5B94C" metalness={0.88} roughness={0.22} />
         </mesh>
       </group>
@@ -272,9 +304,13 @@ export function StainedGlassBackdrop({ quality, primaryColor }: StainedGlassBack
             />
           </mesh>
         ))}
-        {/* Gold Rope Tieback */}
-        <mesh position={[0.2, -0.35, 0.35]} rotation={[Math.PI / 2.2, 0, -0.1]}>
-          <torusGeometry args={[1.15, 0.06, 10, 24, Math.PI]} />
+        {/* Snug Gold Braided Sash Collar hugging curtain pleats */}
+        <mesh
+          position={[0.2, -0.45, 0.02]}
+          rotation={[Math.PI / 2 - 0.12, 0, -0.04]}
+          scale={[1.48, 0.42, 1]}
+        >
+          <torusGeometry args={[1.02, 0.055, 10, 32]} />
           <meshStandardMaterial color="#E5B94C" metalness={0.88} roughness={0.22} />
         </mesh>
       </group>

@@ -1,4 +1,6 @@
+import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -32,6 +34,16 @@ import {
   shouldIgnoreStageKeyboardAction,
 } from '@/hooks/useDisplayController';
 import { computeStageCameraFit } from '@/components/three/StageCameraRig';
+import {
+  computeDigitSlotLayout,
+  computeDigitSlotWorldPosition,
+  CHUTE_SPLINE_COORDS,
+  DIGIT_SLOTS_ANCHOR,
+} from '@/components/three/stage-layout';
+import {
+  computeRevealSchedule,
+  evaluateRevealTimeline,
+} from '@/lib/reveal-timeline';
 import {
   buildBallSpawnPositions,
   CAGE_BOUNDARY_RADIUS,
@@ -375,8 +387,8 @@ describe('Phase 2 Hardening Fixes & Phase 3 Display Controller', () => {
     ]);
   });
 
-  it('shouldIgnoreStageKeyboardAction blocks Space / ArrowRight / Enter during animation and cooldown', () => {
-    // Blocked while reveal animation runs
+  it('shouldIgnoreStageKeyboardAction allows Space fast-forward while blocking ArrowRight / Enter / V / Backspace during animation and cooldown', () => {
+    // Space is explicitly permitted to fast-forward while reveal animation runs
     expect(
       shouldIgnoreStageKeyboardAction({
         key: ' ',
@@ -386,7 +398,7 @@ describe('Phase 2 Hardening Fixes & Phase 3 Display Controller', () => {
         inCooldown: false,
         repeat: false,
       })
-    ).toBe(true);
+    ).toBe(false);
 
     expect(
       shouldIgnoreStageKeyboardAction({
@@ -403,6 +415,28 @@ describe('Phase 2 Hardening Fixes & Phase 3 Display Controller', () => {
       shouldIgnoreStageKeyboardAction({
         key: 'Enter',
         code: 'Enter',
+        isAnimating: true,
+        isSubmitting: false,
+        inCooldown: false,
+        repeat: false,
+      })
+    ).toBe(true);
+
+    expect(
+      shouldIgnoreStageKeyboardAction({
+        key: 'v',
+        code: 'KeyV',
+        isAnimating: true,
+        isSubmitting: false,
+        inCooldown: false,
+        repeat: false,
+      })
+    ).toBe(true);
+
+    expect(
+      shouldIgnoreStageKeyboardAction({
+        key: 'Backspace',
+        code: 'Backspace',
         isAnimating: true,
         isSubmitting: false,
         inCooldown: false,
@@ -445,6 +479,80 @@ describe('Phase 2 Hardening Fixes & Phase 3 Display Controller', () => {
         repeat: false,
       })
     ).toBe(false);
+  });
+
+  it('reveal-timeline paces N=3..8 deterministically in ~15-20s with dramatic last-digit suspense and zero premature reveal', () => {
+    for (const digits of [3, 4, 5, 6, 7, 8]) {
+      const schedule = computeRevealSchedule(digits);
+      expect(schedule.totalDurationSec).toBeGreaterThanOrEqual(15.0);
+      expect(schedule.totalDurationSec).toBeLessThanOrEqual(20.0);
+
+      // Before final reveal timestamp, final digit MUST stay hidden
+      const beforeFinal = evaluateRevealTimeline(digits, schedule.finalRevealAtSec - 0.05);
+      expect(beforeFinal.revealedDigits).toBe(digits - 1);
+      expect(beforeFinal.isFinalRevealVisible).toBe(false);
+
+      // During final suspense, lights dim significantly, cage slows, and ticks increment
+      const midSuspense = evaluateRevealTimeline(
+        digits,
+        schedule.finalSuspenseStartSec + schedule.finalSuspenseSec * 0.65
+      );
+      expect(midSuspense.phase).toBe('final-suspense');
+      expect(midSuspense.stageDimFactor).toBeGreaterThan(0.7);
+      expect(midSuspense.cageSpeedMultiplier).toBeLessThan(0.6);
+      expect(midSuspense.slotHighlightIndex).toBe(digits - 1);
+      expect(midSuspense.suspenseTickStep).toBeGreaterThanOrEqual(3);
+
+      // At final reveal instant, full number appears with light burst active
+      const atFinal = evaluateRevealTimeline(digits, schedule.finalRevealAtSec + 0.01);
+      expect(atFinal.phase).toBe('finale');
+      expect(atFinal.revealedDigits).toBe(digits);
+      expect(atFinal.isFinalRevealVisible).toBe(true);
+      expect(atFinal.finalBurstStrength).toBeGreaterThan(0.85);
+
+      // Completion
+      const complete = evaluateRevealTimeline(digits, schedule.totalDurationSec + 0.1);
+      expect(complete.isComplete).toBe(true);
+      expect(complete.revealedDigits).toBe(digits);
+      expect(complete.finalBurstStrength).toBe(0);
+    }
+
+    // Verify chute extraction works monotonically for repeated digits (e.g. 11111)
+    const sched5 = computeRevealSchedule(5);
+    const chuteMid = evaluateRevealTimeline(5, sched5.introSec + sched5.perLeadingDigitSec * 0.5);
+    expect(chuteMid.activeBall?.digitIndex).toBe(0);
+    expect(chuteMid.activeBall?.chuteT).toBeGreaterThan(0);
+
+    const lastChute = evaluateRevealTimeline(5, sched5.finalChuteStartSec + 0.4);
+    expect(lastChute.phase).toBe('final-chute');
+    expect(lastChute.activeBall?.digitIndex).toBe(4);
+    expect(lastChute.isFinalRevealVisible).toBe(false);
+  });
+
+  it('stage-layout and all local WAV sound assets exist and align with camera clearance', () => {
+    const layout5 = computeDigitSlotLayout(5);
+    expect(layout5.safeDigits).toBe(5);
+    expect(CHUTE_SPLINE_COORDS.length).toBeGreaterThanOrEqual(4);
+    const firstSlotPos = computeDigitSlotWorldPosition(0, 5);
+    const lastSlotPos = computeDigitSlotWorldPosition(4, 5);
+    expect(firstSlotPos[0]).toBeLessThan(DIGIT_SLOTS_ANCHOR[0]);
+    expect(lastSlotPos[0]).toBeGreaterThan(DIGIT_SLOTS_ANCHOR[0]);
+    expect(firstSlotPos[0]).toBeCloseTo(-lastSlotPos[0], 5);
+
+    const soundFiles = [
+      'unlock-chime.wav',
+      'draw-spin-start.wav',
+      'ambient-shimmer.wav',
+      'drum-roll.wav',
+      'tick.wav',
+      'ting.wav',
+      'fanfare.wav',
+    ];
+    for (const file of soundFiles) {
+      const fullPath = path.resolve(process.cwd(), 'public/sounds', file);
+      expect(fs.existsSync(fullPath)).toBe(true);
+      expect(fs.statSync(fullPath).size).toBeGreaterThan(1000);
+    }
   });
 
   it('nextQualityPreset cycles smoothly and computeStageCameraFit adapts cleanly for N=3..7 digits', () => {

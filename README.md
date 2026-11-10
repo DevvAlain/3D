@@ -174,10 +174,11 @@ Truy cập:
 - **`V`**: Đánh dấu vé vắng mặt (`absent`).
 - **`U`**: Hoàn tác vắng mặt lượt cuối (`undo_absent`).
 - **`Backspace`**: Hủy lượt quay cuối & trả số về rổ (`void_last`).
-- **`Q`**: Chuyển nhanh chất lượng đồ họa: **Cao (3D + Transmission + Bloom + 50 bóng)** → **Trung bình (3D + 40 bóng)** → **Thấp (2D an toàn)**.
+- **`Q`**: Chuyển nhanh chất lượng đồ họa: **Trung bình (3D, mặc định + 40 bóng)** → **Thấp (2D an toàn)** → **Cao (3D + Bloom + Phản chiếu + 50 bóng)**.
 - **`D`**: Bật / tắt bảng đo **FPS** trực tiếp.
 - **`M`**: Bật / tắt âm thanh sân khấu (`Howler.js`).
 - **`F`**: Bật / tắt toàn màn hình.
+- *(Ghi chú: bấm `Space` khi hiệu ứng mở từng chữ số đang chạy sẽ tua nhanh tới kết quả cuối cùng).*
 
 ---
 
@@ -193,3 +194,7 @@ Toàn bộ font chữ và tệp âm thanh được lưu trữ cục bộ (không
   - `unlock-chime.wav` — Hợp âm chuông thánh đường khi bấm *Bấm để bắt đầu* (CC0).
   - `draw-spin-start.wav` — Hiệu ứng pha lê khởi động lượt quay (CC0).
   - `ambient-shimmer.wav` — Nhạc nền ambient lặp êm khi chưa tải file nhạc nền riêng của sự kiện (CC0).
+  - `drum-roll.wav` — Nhịp trống hồi hộp lặp mượt trong lúc lồng quay và trước chữ số cuối (CC0).
+  - `tick.wav` — Nhịp đếm hồi hộp cho khoảnh khắc chờ số cuối (CC0).
+  - `ting.wav` — Tiếng chuông pha lê trong trẻo mỗi khi từng quả bóng rơi vào ô số (CC0).
+  - `fanfare.wav` — Hợp âm kèn đồng & chuông mừng chiến thắng khi công bố trọn vẹn dãy số trúng (CC0).

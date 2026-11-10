@@ -1,15 +1,19 @@
 'use client';
 
 import * as React from 'react';
-import { Canvas } from '@react-three/fiber';
+import * as THREE from 'three';
+import { Canvas, useFrame } from '@react-three/fiber';
+import { Environment, Lightformer } from '@react-three/drei';
 import { Physics } from '@react-three/rapier';
 import { Bloom, EffectComposer, Vignette } from '@react-three/postprocessing';
 import type { DisplayController } from '@/hooks/useDisplayController';
+import type { RevealTimelineSnapshot } from '@/lib/reveal-timeline';
 import { DisplayStageChrome } from '@/components/display/DisplayStageChrome';
 import { StainedGlassBackdrop } from '@/components/three/StainedGlassBackdrop';
 import { LotteryCageAndBalls } from '@/components/three/LotteryCageAndBalls';
 import { DigitSlots3D } from '@/components/three/DigitSlots3D';
 import { StageCameraRig } from '@/components/three/StageCameraRig';
+import { VictoryEffects3D } from '@/components/three/VictoryEffects3D';
 
 interface CanvasErrorBoundaryProps {
   onError: () => void;
@@ -38,6 +42,137 @@ class CanvasErrorBoundary extends React.Component<
     if (this.state.hasError) return null;
     return this.props.children;
   }
+}
+
+interface StageLightingRigProps {
+  isHigh: boolean;
+  primaryColor: string;
+  revealTimelineRef: React.MutableRefObject<RevealTimelineSnapshot>;
+}
+
+/**
+ * Dynamically dims fill & rim illumination during last-digit suspense,
+ * focusing a dramatic warm beam on the lottery cage before erupting bright on finale.
+ */
+function StageLightingRig({
+  isHigh,
+  primaryColor,
+  revealTimelineRef,
+}: StageLightingRigProps) {
+  const ambientRef = React.useRef<THREE.AmbientLight>(null);
+  const hemiRef = React.useRef<THREE.HemisphereLight>(null);
+  const spotRef = React.useRef<THREE.SpotLight>(null);
+  const leftRimRef = React.useRef<THREE.PointLight>(null);
+  const rightRimRef = React.useRef<THREE.PointLight>(null);
+  const roseBackRef = React.useRef<THREE.PointLight>(null);
+  const lecternFillRef = React.useRef<THREE.PointLight>(null);
+
+  useFrame((_, delta) => {
+    const dt = Math.min(delta, 0.05);
+    const k = 1 - Math.exp(-7.5 * dt);
+    const { stageDimFactor, finalBurstStrength } = revealTimelineRef.current;
+
+    const fillScale = 1 - stageDimFactor * 0.88 + finalBurstStrength * 0.45;
+    if (ambientRef.current) {
+      ambientRef.current.intensity = THREE.MathUtils.lerp(
+        ambientRef.current.intensity,
+        0.48 * fillScale,
+        k
+      );
+    }
+    if (hemiRef.current) {
+      hemiRef.current.intensity = THREE.MathUtils.lerp(
+        hemiRef.current.intensity,
+        0.64 * fillScale,
+        k
+      );
+    }
+    if (spotRef.current) {
+      // Overhead spotlight tightens onto the cage during tense final-digit spotlight moment
+      const spotTarget = 84 * (1 + stageDimFactor * 0.55 + finalBurstStrength * 0.65);
+      const angleTarget = 0.56 - stageDimFactor * 0.28 + finalBurstStrength * 0.08;
+      spotRef.current.intensity = THREE.MathUtils.lerp(spotRef.current.intensity, spotTarget, k);
+      spotRef.current.angle = THREE.MathUtils.lerp(spotRef.current.angle, angleTarget, k);
+    }
+    if (leftRimRef.current) {
+      leftRimRef.current.intensity = THREE.MathUtils.lerp(
+        leftRimRef.current.intensity,
+        30 * (1 - stageDimFactor * 0.85 + finalBurstStrength * 0.5),
+        k
+      );
+    }
+    if (rightRimRef.current) {
+      rightRimRef.current.intensity = THREE.MathUtils.lerp(
+        rightRimRef.current.intensity,
+        30 * (1 - stageDimFactor * 0.85 + finalBurstStrength * 0.5),
+        k
+      );
+    }
+    if (roseBackRef.current) {
+      roseBackRef.current.intensity = THREE.MathUtils.lerp(
+        roseBackRef.current.intensity,
+        24 * (1 - stageDimFactor * 0.78 + finalBurstStrength * 0.85),
+        k
+      );
+    }
+    if (lecternFillRef.current) {
+      lecternFillRef.current.intensity = THREE.MathUtils.lerp(
+        lecternFillRef.current.intensity,
+        12 * (1 - stageDimFactor * 0.42 + finalBurstStrength * 1.1),
+        k
+      );
+    }
+  });
+
+  return (
+    <>
+      <ambientLight ref={ambientRef} intensity={0.48} color="#D4E1FF" />
+      <hemisphereLight ref={hemiRef} args={['#FFE8B3', '#160B2E', 0.64]} />
+
+      <spotLight
+        ref={spotRef}
+        position={[0, 7.6, 4.4]}
+        angle={0.56}
+        penumbra={0.72}
+        intensity={84}
+        color="#FFF2D2"
+        castShadow={isHigh}
+        shadow-mapSize={[1024, 1024]}
+        shadow-bias={-0.0004}
+      />
+
+      <pointLight
+        ref={leftRimRef}
+        position={[-4.2, 2.6, -1.6]}
+        intensity={30}
+        distance={14}
+        color="#FFD062"
+      />
+      <pointLight
+        ref={rightRimRef}
+        position={[4.2, 2.6, -1.6]}
+        intensity={30}
+        distance={14}
+        color="#FFD062"
+      />
+
+      <pointLight
+        ref={roseBackRef}
+        position={[0, 2.4, -4.1]}
+        intensity={24}
+        distance={12}
+        color={primaryColor}
+      />
+
+      <pointLight
+        ref={lecternFillRef}
+        position={[0, 0.3, 4.8]}
+        intensity={12}
+        distance={9}
+        color="#FFEAB8"
+      />
+    </>
+  );
 }
 
 interface DisplayStage3DProps {
@@ -70,7 +205,7 @@ export function DisplayStage3D({ controller }: DisplayStage3DProps) {
           className="h-full w-full"
           dpr={isHigh ? [1, 2] : [1, 1.5]}
           shadows={isHigh}
-          camera={{ position: [0, 0.75, 7.9], fov: 42, near: 0.1, far: 50 }}
+          camera={{ position: [0, 0.85, 8.73], fov: 42, near: 0.1, far: 50 }}
           gl={{
             antialias: true,
             powerPreference: 'high-performance',
@@ -91,62 +226,60 @@ export function DisplayStage3D({ controller }: DisplayStage3DProps) {
           }}
         >
           <color attach="background" args={['#060918']} />
-          <fog attach="fog" args={['#060918', 11, 24]} />
+          <fog attach="fog" args={['#060918', 11, 25]} />
 
-          {/* Sanctuary Lighting: Overhead Spotlight + Dual Gold Rim Lights */}
-          <ambientLight intensity={0.44} color="#D4E1FF" />
-          <hemisphereLight args={['#FFE8B3', '#160B2E', 0.58]} />
+          {/* Procedural Sanctuary Cubemap Reflections (baked once, zero network assets) */}
+          <Environment resolution={128} frames={1}>
+            <Lightformer
+              form="ring"
+              intensity={2.4}
+              color="#FFE9A8"
+              scale={[6, 6, 1]}
+              position={[0, 5.5, 2]}
+              rotation={[Math.PI / 2, 0, 0]}
+            />
+            <Lightformer
+              form="circle"
+              intensity={2.2}
+              color={primaryColor}
+              scale={5}
+              position={[0, 2.5, -5.5]}
+            />
+            <Lightformer
+              form="rect"
+              intensity={1.7}
+              color="#E11D48"
+              scale={[3.2, 5, 1]}
+              position={[-5.5, 2, -1]}
+              rotation={[0, Math.PI / 2.2, 0]}
+            />
+            <Lightformer
+              form="rect"
+              intensity={1.7}
+              color="#2563EB"
+              scale={[3.2, 5, 1]}
+              position={[5.5, 2, -1]}
+              rotation={[0, -Math.PI / 2.2, 0]}
+            />
+          </Environment>
 
-          <spotLight
-            position={[0, 7.6, 4.4]}
-            angle={0.56}
-            penumbra={0.72}
-            intensity={80}
-            color="#FFF2D2"
-            castShadow={isHigh}
-            shadow-mapSize={[1024, 1024]}
-            shadow-bias={-0.0004}
-          />
-
-          {/* Left & Right Gold Rim Lights */}
-          <pointLight
-            position={[-4.2, 2.6, -1.6]}
-            intensity={28}
-            distance={14}
-            color="#FFD062"
-          />
-          <pointLight
-            position={[4.2, 2.6, -1.6]}
-            intensity={28}
-            distance={14}
-            color="#FFD062"
-          />
-
-          {/* Soft Warm Rose-Window Sanctuary Backlight */}
-          <pointLight
-            position={[0, 2.4, -4.1]}
-            intensity={22}
-            distance={12}
-            color={primaryColor}
-          />
-
-          {/* Foreground Lectern Warm Fill */}
-          <pointLight
-            position={[0, 0.25, 4.8]}
-            intensity={9}
-            distance={8}
-            color="#FFEAB8"
+          <StageLightingRig
+            isHigh={isHigh}
+            primaryColor={primaryColor}
+            revealTimelineRef={controller.revealTimelineRef}
           />
 
           <StageCameraRig
             digits={digits}
             measureFps={controller.showFps}
             onFpsSample={setFps}
+            revealTimelineRef={controller.revealTimelineRef}
           />
 
           <StainedGlassBackdrop
             quality={controller.quality}
             primaryColor={primaryColor}
+            revealTimelineRef={controller.revealTimelineRef}
           />
 
           <React.Suspense fallback={null}>
@@ -154,6 +287,9 @@ export function DisplayStage3D({ controller }: DisplayStage3DProps) {
               <LotteryCageAndBalls
                 quality={controller.quality}
                 isSpinBoost={isSpinBoost}
+                digits={digits}
+                activeRevealTicketDigits={controller.activeRevealTicketDigits}
+                revealTimelineRef={controller.revealTimelineRef}
               />
             </Physics>
           </React.Suspense>
@@ -162,16 +298,20 @@ export function DisplayStage3D({ controller }: DisplayStage3DProps) {
             digits={digits}
             currentTicket={currentTicket}
             revealedDigits={controller.revealedDigits}
+            isFinalReveal={controller.isFinalRevealVisible}
+            revealTimelineRef={controller.revealTimelineRef}
           />
+
+          <VictoryEffects3D burstKey={controller.confettiBurstKey} />
 
           {isHigh ? (
             <EffectComposer multisampling={0}>
               <Bloom
                 mipmapBlur
-                luminanceThreshold={0.85}
-                intensity={0.44}
+                luminanceThreshold={0.9}
+                intensity={0.36}
               />
-              <Vignette eskil={false} offset={0.28} darkness={0.48} />
+              <Vignette eskil={false} offset={0.28} darkness={0.42} />
             </EffectComposer>
           ) : null}
         </Canvas>

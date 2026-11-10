@@ -3,7 +3,6 @@
 import * as React from 'react';
 import * as THREE from 'three';
 import { useFrame } from '@react-three/fiber';
-import { MeshTransmissionMaterial } from '@react-three/drei';
 import {
   BallCollider,
   CuboidCollider,
@@ -12,6 +11,7 @@ import {
   type RapierRigidBody,
 } from '@react-three/rapier';
 import type { DisplayQualityPreset } from '@/hooks/useDisplayController';
+import type { RevealTimelineSnapshot } from '@/lib/reveal-timeline';
 import {
   createBallDigitTexture,
   disposeTextureList,
@@ -25,10 +25,17 @@ import {
   isRigidBodyLive,
   WALL_THICKNESS,
 } from '@/components/three/rapier-guards';
+import {
+  CHUTE_SPLINE_COORDS,
+  computeDigitSlotWorldPosition,
+} from '@/components/three/stage-layout';
 
 interface LotteryCageAndBallsProps {
   quality: DisplayQualityPreset;
   isSpinBoost: boolean;
+  digits: number;
+  activeRevealTicketDigits: number[];
+  revealTimelineRef: React.MutableRefObject<RevealTimelineSnapshot>;
 }
 
 // Build 26 evenly spaced unit normals (6 faces + 12 edges + 8 corners of a cube)
@@ -56,7 +63,6 @@ const CAGE_WALL_NORMALS: Array<{
       n.z * offsetDist,
     ];
     const q = new THREE.Quaternion().setFromUnitVectors(up, n);
-    // Handle exact -Y flip safely
     if (n.y < -0.9999 && Math.abs(n.x) < 1e-6 && Math.abs(n.z) < 1e-6) {
       q.setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
     }
@@ -73,6 +79,7 @@ interface LotteryBallBodyProps {
   position: [number, number, number];
   radius: number;
   texture: THREE.CanvasTexture;
+  envIntensity: number;
   registerBody: (id: number, body: RapierRigidBody | null) => void;
 }
 
@@ -81,6 +88,7 @@ const LotteryBallBody = React.memo(function LotteryBallBody({
   position,
   radius,
   texture,
+  envIntensity,
   registerBody,
 }: LotteryBallBodyProps) {
   const handleRef = React.useCallback(
@@ -90,8 +98,6 @@ const LotteryBallBody = React.memo(function LotteryBallBody({
     [id, registerBody]
   );
 
-  // @react-three/rapier does not invoke props.ref(null) on unmount/StrictMode cleanup,
-  // so unregister explicitly here before any subsequent physics step touches the body.
   React.useEffect(() => {
     return () => {
       registerBody(id, null);
@@ -114,10 +120,12 @@ const LotteryBallBody = React.memo(function LotteryBallBody({
         <sphereGeometry args={[radius, 24, 18]} />
         <meshPhysicalMaterial
           map={texture}
-          roughness={0.18}
-          metalness={0.12}
-          clearcoat={0.85}
-          clearcoatRoughness={0.12}
+          roughness={0.09}
+          metalness={0.08}
+          clearcoat={1.0}
+          clearcoatRoughness={0.06}
+          reflectivity={0.95}
+          envMapIntensity={envIntensity}
         />
       </mesh>
     </RigidBody>
@@ -127,19 +135,28 @@ const LotteryBallBody = React.memo(function LotteryBallBody({
 export function LotteryCageAndBalls({
   quality,
   isSpinBoost,
+  digits,
+  activeRevealTicketDigits,
+  revealTimelineRef,
 }: LotteryCageAndBallsProps) {
   const cageBodyRef = React.useRef<RapierRigidBody | null>(null);
   const visualCageRef = React.useRef<THREE.Group>(null);
+  const revealBallGroupRef = React.useRef<THREE.Group>(null);
+  const revealBallMeshRef = React.useRef<THREE.Mesh>(null);
+  const revealBallMatRef = React.useRef<THREE.MeshPhysicalMaterial>(null);
   const ballBodiesRef = React.useRef<Map<number, RapierRigidBody>>(new Map());
   const spinAngleRef = React.useRef<number>(0);
   const currentSpeedRef = React.useRef<number>(0.72);
   const tempQuatRef = React.useRef(new THREE.Quaternion());
   const spinAxisRef = React.useRef(new THREE.Vector3(1, 0.14, 0.06).normalize());
+  const chutePosVecRef = React.useRef(new THREE.Vector3());
+  const lastBallTexDigitRef = React.useRef<number>(-1);
 
   const ballCount = quality === 'high' ? 50 : 40;
   const ballRadius = quality === 'high' ? 0.188 : 0.198;
+  const ballEnvIntensity = quality === 'high' ? 1.35 : 1.05;
 
-  // Bake 10 crisp equirectangular CanvasTextures for digits 0-9 once and dispose cleanly
+  // Bake 10 crisp stained-glass jewel digit textures once and dispose cleanly
   const digitTextures = React.useMemo(() => {
     return Array.from({ length: 10 }, (_, d) => createBallDigitTexture(d));
   }, []);
@@ -150,7 +167,6 @@ export function LotteryCageAndBalls({
     };
   }, [digitTextures]);
 
-  // Clear all Rapier handle caches cleanly on unmount / StrictMode double-invoke
   React.useEffect(() => {
     const bodies = ballBodiesRef.current;
     return () => {
@@ -159,16 +175,15 @@ export function LotteryCageAndBalls({
     };
   }, []);
 
-  // Curved brass exit chute sweeping from cage bottom to reveal tray
-  const chuteGeometry = React.useMemo(() => {
-    const curve = new THREE.CatmullRomCurve3([
-      new THREE.Vector3(0, -0.26, 0.52),
-      new THREE.Vector3(0, -0.56, 1.05),
-      new THREE.Vector3(0, -0.82, 1.52),
-      new THREE.Vector3(0, -0.94, 1.92),
-    ]);
-    return new THREE.TubeGeometry(curve, 28, 0.145, 16, false);
+  const chuteCurve = React.useMemo(() => {
+    return new THREE.CatmullRomCurve3(
+      CHUTE_SPLINE_COORDS.map(([x, y, z]) => new THREE.Vector3(x, y, z))
+    );
   }, []);
+
+  const chuteGeometry = React.useMemo(() => {
+    return new THREE.TubeGeometry(chuteCurve, 28, 0.145, 16, false);
+  }, [chuteCurve]);
 
   React.useEffect(() => {
     return () => {
@@ -196,14 +211,22 @@ export function LotteryCageAndBalls({
     []
   );
 
-  // Pure Three.js animation tick — never invoke Rapier WASM FFI calls inside useFrame
+  // Pure Three.js animation tick (cage spin + kinematic reveal ball sliding down chute into slot)
   useFrame((_, delta) => {
     const dt = Math.min(delta, 0.05);
-    const targetSpeed = isSpinBoost ? 1.85 : 0.72;
+    const timeline = revealTimelineRef.current;
+
+    const baseIdle = isSpinBoost ? 1.25 : 0.72;
+    const timelineMul =
+      timeline.phase === 'idle' || timeline.phase === 'complete'
+        ? 1
+        : timeline.cageSpeedMultiplier;
+    const targetSpeed = baseIdle * timelineMul;
+
     currentSpeedRef.current = THREE.MathUtils.lerp(
       currentSpeedRef.current,
       targetSpeed,
-      1 - Math.exp(-3.5 * dt)
+      1 - Math.exp(-5.0 * dt)
     );
     spinAngleRef.current += currentSpeedRef.current * dt;
 
@@ -211,6 +234,55 @@ export function LotteryCageAndBalls({
 
     if (visualCageRef.current) {
       visualCageRef.current.quaternion.copy(tempQuatRef.current);
+    }
+
+    // Update scripted kinematic Extraction Ball (never depends on Rapier physics, works for 11111 too)
+    const ballGroup = revealBallGroupRef.current;
+    const ballMesh = revealBallMeshRef.current;
+    const ballMat = revealBallMatRef.current;
+    const active = timeline.activeBall;
+
+    if (ballGroup && ballMesh && ballMat) {
+      if (!active || activeRevealTicketDigits.length === 0) {
+        ballGroup.visible = false;
+      } else {
+        const targetDigit = activeRevealTicketDigits[active.digitIndex] ?? 0;
+        if (lastBallTexDigitRef.current !== targetDigit) {
+          lastBallTexDigitRef.current = targetDigit;
+          ballMat.map = digitTextures[targetDigit] ?? digitTextures[0];
+          ballMat.needsUpdate = true;
+        }
+
+        ballGroup.visible = true;
+        if (active.chuteT !== null) {
+          // Glides down exact brass chute spline
+          chuteCurve.getPointAt(active.chuteT, chutePosVecRef.current);
+          ballGroup.position.copy(chutePosVecRef.current);
+          ballGroup.scale.setScalar(1.02);
+          ballMesh.rotation.set(active.chuteT * Math.PI * 3.5, 0.4, 0);
+        } else if (active.arcT !== null) {
+          // Parabolic leap from chute mouth into slot `active.digitIndex`
+          const endCoord = CHUTE_SPLINE_COORDS[CHUTE_SPLINE_COORDS.length - 1];
+          const [slotX, slotY, slotZ] = computeDigitSlotWorldPosition(
+            active.digitIndex,
+            digits
+          );
+          const u = active.arcT;
+          const x = THREE.MathUtils.lerp(endCoord[0], slotX, u);
+          const y =
+            THREE.MathUtils.lerp(endCoord[1], slotY, u) + Math.sin(u * Math.PI) * 0.62;
+          const z = THREE.MathUtils.lerp(endCoord[2], slotZ, u);
+
+          ballGroup.position.set(x, y, z);
+          ballGroup.scale.setScalar(THREE.MathUtils.lerp(1.08, 0.72, u * u));
+          // Finish orienting digit medallion clearly toward the camera!
+          ballMesh.rotation.set(
+            THREE.MathUtils.lerp(0.6, 0, u),
+            THREE.MathUtils.lerp(Math.PI * 1.4, -Math.PI / 2, u),
+            0
+          );
+        }
+      }
     }
   });
 
@@ -262,29 +334,29 @@ export function LotteryCageAndBalls({
           <meshStandardMaterial color="#D4A13A" metalness={0.9} roughness={0.22} />
         </mesh>
         {/* Central sanctuary pedestal column */}
-        <mesh position={[0, 0.72, 0]} castShadow receiveShadow>
-          <cylinderGeometry args={[1.1, 1.48, 0.8, 12]} />
+        <mesh position={[0, 0.74, 0]} castShadow receiveShadow>
+          <cylinderGeometry args={[1.1, 1.48, 0.84, 12]} />
           <meshStandardMaterial color="#181236" roughness={0.42} metalness={0.32} />
         </mesh>
         {/* Upper gold altar collar */}
-        <mesh position={[0, 1.15, 0]} castShadow>
+        <mesh position={[0, 1.19, 0]} castShadow>
           <cylinderGeometry args={[1.38, 1.18, 0.12, 32]} />
           <meshStandardMaterial color="#E5B94C" metalness={0.9} roughness={0.2} />
         </mesh>
 
-        {/* Left & Right Curved Brass Cradle Pillars holding the axle at y=1.18 (relative +2.83) */}
+        {/* Left & Right Curved Brass Cradle Pillars holding the axle at CAGE_CENTER[1] = 1.24 (relative +2.89) */}
         {[-1, 1].map((side) => (
           <group key={side}>
             <mesh
-              position={[side * 1.32, 1.98, 0]}
+              position={[side * 1.32, 2.03, 0]}
               rotation={[0, 0, -side * 0.24]}
               castShadow
             >
-              <cylinderGeometry args={[0.075, 0.11, 1.85, 16]} />
+              <cylinderGeometry args={[0.075, 0.11, 1.88, 16]} />
               <meshStandardMaterial color="#D4A13A" metalness={0.9} roughness={0.22} />
             </mesh>
             {/* Axle bearing cap */}
-            <mesh position={[side * 1.56, 2.83, 0]} rotation={[0, 0, Math.PI / 2]}>
+            <mesh position={[side * 1.56, 2.89, 0]} rotation={[0, 0, Math.PI / 2]}>
               <cylinderGeometry args={[0.14, 0.14, 0.18, 20]} />
               <meshStandardMaterial color="#F5C451" metalness={0.92} roughness={0.18} />
             </mesh>
@@ -292,7 +364,7 @@ export function LotteryCageAndBalls({
         ))}
       </group>
 
-      {/* Gold Exit Chute & Catch Tray */}
+      {/* Gold Exit Chute & Catch Tray (elevated cleanly above middle digit plaque) */}
       <group>
         <mesh geometry={chuteGeometry} castShadow>
           <meshStandardMaterial
@@ -304,14 +376,32 @@ export function LotteryCageAndBalls({
           />
         </mesh>
         {/* Chute exit bezel */}
-        <mesh position={[0, -0.94, 1.95]} rotation={[Math.PI / 3, 0, 0]}>
-          <torusGeometry args={[0.16, 0.032, 12, 28]} />
+        <mesh position={[0, -0.36, 1.88]} rotation={[Math.PI / 3.4, 0, 0]}>
+          <torusGeometry args={[0.165, 0.032, 12, 28]} />
           <meshStandardMaterial color="#FCE08B" metalness={0.92} roughness={0.18} />
         </mesh>
         {/* Catch tray dish below chute mouth */}
-        <mesh position={[0, -1.2, 2.02]} receiveShadow castShadow>
-          <cylinderGeometry args={[0.38, 0.28, 0.08, 24]} />
+        <mesh position={[0, -0.52, 1.92]} receiveShadow castShadow>
+          <cylinderGeometry args={[0.34, 0.24, 0.06, 24]} />
           <meshStandardMaterial color="#C8962E" metalness={0.88} roughness={0.24} />
+        </mesh>
+      </group>
+
+      {/* Kinematic Scripted Reveal Ball (travels chute -> arcs into target digit slot) */}
+      <group ref={revealBallGroupRef} visible={false}>
+        <pointLight color="#FFE394" intensity={6.5} distance={3.2} />
+        <mesh ref={revealBallMeshRef} castShadow>
+          <sphereGeometry args={[0.21, 28, 22]} />
+          <meshPhysicalMaterial
+            ref={revealBallMatRef}
+            map={digitTextures[0]}
+            roughness={0.08}
+            metalness={0.08}
+            clearcoat={1.0}
+            clearcoatRoughness={0.05}
+            reflectivity={0.98}
+            envMapIntensity={1.5}
+          />
         </mesh>
       </group>
 
@@ -349,34 +439,22 @@ export function LotteryCageAndBalls({
 
       {/* Synchronized Visual Crystal & Ornate Gold Lottery Cage */}
       <group ref={visualCageRef} position={CAGE_CENTER}>
-        {/* Refractive Crystal Shell (MeshTransmissionMaterial on high, light Fresnel on medium) */}
+        {/* Crystal-Clear Thin Glass Dome (zero transmission FBO blur or pixelation) */}
         <mesh>
-          <sphereGeometry args={[CAGE_RADIUS + 0.03, 42, 32]} />
-          {quality === 'high' ? (
-            <MeshTransmissionMaterial
-              transmission={0.92}
-              thickness={0.18}
-              roughness={0.07}
-              ior={1.45}
-              chromaticAberration={0.025}
-              anisotropy={0}
-              distortion={0.03}
-              samples={4}
-              resolution={256}
-              color="#FFF9EC"
-            />
-          ) : (
-            <meshPhysicalMaterial
-              color="#DCE8FF"
-              transparent
-              opacity={0.2}
-              roughness={0.08}
-              metalness={0.1}
-              clearcoat={1}
-              reflectivity={0.92}
-              depthWrite={false}
-            />
-          )}
+          <sphereGeometry args={[CAGE_RADIUS + 0.03, 48, 36]} />
+          <meshPhysicalMaterial
+            color="#E8F1FF"
+            transparent
+            opacity={quality === 'high' ? 0.14 : 0.17}
+            roughness={0.04}
+            metalness={0.04}
+            clearcoat={1.0}
+            clearcoatRoughness={0.03}
+            ior={1.5}
+            reflectivity={1.0}
+            envMapIntensity={quality === 'high' ? 1.65 : 1.0}
+            depthWrite={false}
+          />
         </mesh>
 
         {/* Ornate Gold Meridian & Equatorial Rings */}
@@ -412,7 +490,7 @@ export function LotteryCageAndBalls({
         </mesh>
       </group>
 
-      {/* 40-50 Dynamic Glossy Numbered Balls (0-9 via CanvasTexture) */}
+      {/* 40-50 Dynamic Glossy Stained-Glass Jewel Balls (0-9 via CanvasTexture) */}
       {ballConfigs.map((ball) => (
         <LotteryBallBody
           key={ball.id}
@@ -420,6 +498,7 @@ export function LotteryCageAndBalls({
           position={ball.pos}
           radius={ballRadius}
           texture={digitTextures[ball.digit]}
+          envIntensity={ballEnvIntensity}
           registerBody={registerBallBody}
         />
       ))}

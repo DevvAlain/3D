@@ -2,7 +2,14 @@
 
 import { Howl, Howler } from 'howler';
 
-export type SoundCue = 'unlock' | 'spinStart' | 'ambient';
+export type SoundCue =
+  | 'unlock'
+  | 'spinStart'
+  | 'ambient'
+  | 'drumRoll'
+  | 'tick'
+  | 'ting'
+  | 'fanfare';
 
 /**
  * Local audio manager backed by Howler.js and self-hosted WAV assets in `/sounds/`.
@@ -12,6 +19,10 @@ export class DisplaySoundEngine {
   private unlockSfx: Howl | null = null;
   private spinStartSfx: Howl | null = null;
   private ambientPad: Howl | null = null;
+  private drumRollSfx: Howl | null = null;
+  private tickSfx: Howl | null = null;
+  private tingSfx: Howl | null = null;
+  private fanfareSfx: Howl | null = null;
   private bgMusic: Howl | null = null;
   private bgMusicUrl: string | null = null;
   private muted: boolean = false;
@@ -35,7 +46,32 @@ export class DisplaySoundEngine {
     this.ambientPad = new Howl({
       src: ['/sounds/ambient-shimmer.wav'],
       loop: true,
-      volume: 0.16,
+      volume: 0.14,
+      preload: true,
+    });
+
+    this.drumRollSfx = new Howl({
+      src: ['/sounds/drum-roll.wav'],
+      loop: true,
+      volume: 0.34,
+      preload: true,
+    });
+
+    this.tickSfx = new Howl({
+      src: ['/sounds/tick.wav'],
+      volume: 0.42,
+      preload: true,
+    });
+
+    this.tingSfx = new Howl({
+      src: ['/sounds/ting.wav'],
+      volume: 0.58,
+      preload: true,
+    });
+
+    this.fanfareSfx = new Howl({
+      src: ['/sounds/fanfare.wav'],
+      volume: 0.64,
       preload: true,
     });
   }
@@ -94,10 +130,68 @@ export class DisplaySoundEngine {
     }
   }
 
+  startDrumRoll(volume: number = 0.34): void {
+    if (!this.unlocked || this.muted || !this.drumRollSfx) return;
+    try {
+      this.drumRollSfx.volume(volume);
+      if (!this.drumRollSfx.playing()) {
+        this.drumRollSfx.play();
+      }
+    } catch {
+      // Non-fatal audio playback fallback
+    }
+  }
+
+  setDrumRollVolume(volume: number): void {
+    try {
+      this.drumRollSfx?.volume(Math.max(0, Math.min(1, volume)));
+    } catch {
+      // Ignore
+    }
+  }
+
+  stopDrumRoll(): void {
+    try {
+      this.drumRollSfx?.stop();
+    } catch {
+      // Ignore
+    }
+  }
+
+  playTick(): void {
+    if (!this.unlocked || this.muted) return;
+    try {
+      this.tickSfx?.play();
+    } catch {
+      // Non-fatal audio playback fallback
+    }
+  }
+
+  playTing(): void {
+    if (!this.unlocked || this.muted) return;
+    try {
+      this.tingSfx?.play();
+    } catch {
+      // Non-fatal audio playback fallback
+    }
+  }
+
+  playFanfare(): void {
+    this.stopDrumRoll();
+    if (!this.unlocked || this.muted) return;
+    try {
+      this.fanfareSfx?.play();
+    } catch {
+      // Non-fatal audio playback fallback
+    }
+  }
+
   setMuted(nextMuted: boolean): void {
     this.muted = nextMuted;
     Howler.mute(nextMuted);
-    if (!nextMuted && this.unlocked) {
+    if (nextMuted) {
+      this.stopDrumRoll();
+    } else if (this.unlocked) {
       if (this.bgMusic && !this.bgMusic.playing()) {
         this.bgMusic.play();
       } else if (!this.bgMusic && this.ambientPad && !this.ambientPad.playing()) {
@@ -111,13 +205,22 @@ export class DisplaySoundEngine {
   }
 
   dispose(): void {
+    this.stopDrumRoll();
     this.unlockSfx?.unload();
     this.spinStartSfx?.unload();
     this.ambientPad?.unload();
+    this.drumRollSfx?.unload();
+    this.tickSfx?.unload();
+    this.tingSfx?.unload();
+    this.fanfareSfx?.unload();
     this.bgMusic?.unload();
     this.unlockSfx = null;
     this.spinStartSfx = null;
     this.ambientPad = null;
+    this.drumRollSfx = null;
+    this.tickSfx = null;
+    this.tingSfx = null;
+    this.fanfareSfx = null;
     this.bgMusic = null;
   }
 }
