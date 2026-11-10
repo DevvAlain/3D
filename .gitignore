@@ -10,6 +10,7 @@ out/
 # Build artifacts
 dist/
 build/
+*.tsbuildinfo
 
 # Environment files
 .env

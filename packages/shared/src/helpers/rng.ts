@@ -1,9 +1,7 @@
-import crypto from 'node:crypto';
-
 /**
  * Generates a cryptographically secure random integer in [0, max) using rejection sampling.
  * Eliminates modulo bias completely.
- * Matches the PostgreSQL crypto_random_int implementation.
+ * Matches the PostgreSQL crypto_random_int implementation and works across Node & Web runtimes.
  */
 export function cryptoRandomInt(max: number): number {
   if (max <= 0) {
@@ -16,10 +14,11 @@ export function cryptoRandomInt(max: number): number {
   // 32-bit limit
   const cM = 0x100000000; // 4294967296 (2^32)
   const limit = cM - (cM % max);
+  const buf = new Uint32Array(1);
 
   while (true) {
-    const buffer = crypto.randomBytes(4);
-    const rand = buffer.readUInt32BE(0);
+    globalThis.crypto.getRandomValues(buf);
+    const rand = buf[0]!;
 
     // Rejection sampling: discard values in the biased remainder tail
     if (rand < limit) {

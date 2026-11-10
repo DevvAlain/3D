@@ -107,19 +107,23 @@ pnpm install
 
 ### 2. Thiết lập Biến Môi Trường
 
-Sao chép `.env.example` thành `.env` tại thư mục root và điền giá trị thực từ Supabase Dashboard:
+Sao chép `.env.example` thành `.env` tại thư mục root (hoặc `apps/web/.env.local`) và điền giá trị thực từ Supabase Dashboard:
 
 ```bash
 cp .env.example .env
 ```
 
-> ⚠️ **Cảnh báo bảo mật**: Tuyệt đối không đặt tiền tố `NEXT_PUBLIC_` cho `SUPABASE_SERVICE_ROLE_KEY` hoặc `DATABASE_URL`. Các key này chỉ dùng ở phía server.
+Hỗ trợ cả 2 bộ tên khóa phổ biến của Supabase:
+- Public client: `NEXT_PUBLIC_SUPABASE_URL` + `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` (hoặc `NEXT_PUBLIC_SUPABASE_ANON_KEY`).
+- Server-only: `SUPABASE_URL` + `SUPABASE_SECRET_KEY` (hoặc `SUPABASE_SERVICE_ROLE_KEY`).
+
+> ⚠️ **Cảnh báo bảo mật**: Tuyệt đối không đặt tiền tố `NEXT_PUBLIC_` cho `SUPABASE_SECRET_KEY`, `SUPABASE_SERVICE_ROLE_KEY` hoặc `DATABASE_URL`. Các key này chỉ dùng ở phía server.
 
 ### 3. Áp dụng Database Migrations với Supabase CLI
 
 Thư mục `supabase/migrations/` chỉ chứa 2 file schema & RPCs chính thức:
-- `20261109000001_initial_schema.sql`: Bảng, `ON DELETE RESTRICT`, `UNIQUE (event_id, is_test, seq)`, Partial Unique Indexes, RLS (`draws` chỉ SELECT cho admin), Realtime publication, Storage bucket (chỉ PNG/JPEG/WEBP/Audio, bỏ SVG).
-- `20261109000002_draw_rpcs.sql`: Hàm `draw_next`, `confirm_won`, `mark_absent`, `void_last`, `clear_test_draws`, `reset_event`, CSPRNG rejection sampling.
+- `20261109000001_initial_schema.sql`: Bảng (`events`, `prizes`, `excluded_tickets`, `draws`, `audit_logs`), `ON DELETE RESTRICT`, `UNIQUE (event_id, is_test, seq)`, Partial Unique Indexes, trigger khóa dải số / vé loại trừ / số lượng giải khi đã có quay chính thức, RLS (`draws` & `audit_logs` chỉ SELECT cho admin), Realtime publication, Storage bucket (chỉ PNG/JPEG/WEBP/Audio, bỏ SVG).
+- `20261109000002_draw_rpcs.sql`: Hàm `draw_next`, `confirm_won`, `mark_absent`, `undo_absent`, `void_last`, `clear_test_draws`, `reset_event` (ghi `audit_logs`), CSPRNG rejection sampling (mọi hàm `SECURITY DEFINER` đều gắn `pg_temp` trong `search_path`).
 
 File dữ liệu mẫu `supabase/seed.sql` được tách riêng, không nằm trong migrations.
 
@@ -140,7 +144,7 @@ psql "$DATABASE_URL" -f supabase/seed.sql
 pnpm test
 ```
 
-### 5. Chạy Integration Test Suite (8 Kịch bản Multi-Connection chuyên sâu)
+### 5. Chạy Integration Test Suite (9 Kịch bản Multi-Connection chuyên sâu)
 
 Kịch bản tự động chạy trên `supabase start` (nếu đang chạy ở cổng 54321/54322) hoặc tự khởi tạo Embedded PostgreSQL cục bộ với 25 kết nối song song (`pg.Pool`):
 
@@ -156,5 +160,6 @@ pnpm dev
 
 Truy cập:
 - Trang chủ: [http://localhost:3000](http://localhost:3000)
-- Màn hình sân khấu: [http://localhost:3000/display](http://localhost:3000/display)
-- Bảng quản trị: [http://localhost:3000/admin](http://localhost:3000/admin)
+- Màn hình sân khấu (Presenter): [http://localhost:3000/display](http://localhost:3000/display)
+- Xem trước chỉ đọc (Admin Preview): [http://localhost:3000/display?preview=1](http://localhost:3000/display?preview=1)
+- Bảng quản trị (Admin): [http://localhost:3000/admin](http://localhost:3000/admin)
