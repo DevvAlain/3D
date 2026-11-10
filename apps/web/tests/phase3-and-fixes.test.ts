@@ -1,3 +1,5 @@
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mockGetUser = vi.fn();
@@ -30,6 +32,16 @@ import {
   shouldIgnoreStageKeyboardAction,
 } from '@/hooks/useDisplayController';
 import { computeStageCameraFit } from '@/components/three/StageCameraRig';
+import {
+  buildBallSpawnPositions,
+  CAGE_BOUNDARY_RADIUS,
+  CAGE_CENTER,
+  CAGE_RADIUS,
+  isPointOutsideBoundary,
+  isRigidBodyLive,
+  type RapierRigidBodyLike,
+  type RapierWorldLike,
+} from '@/components/three/rapier-guards';
 
 const EVENT_ID = '11111111-1111-4111-8111-111111111111';
 const PRIZE_ID = '22222222-2222-4222-8222-222222222222';
@@ -448,5 +460,98 @@ describe('Phase 2 Hardening Fixes & Phase 3 Display Controller', () => {
     expect(fit5.z).toBeGreaterThan(fit3.z);
     expect(fit7.z).toBeGreaterThan(fit5.z);
     expect(fit5Narrow.z).toBeGreaterThan(fit5.z);
+  });
+
+  it('rapier-guards safely reject removed, cross-world, and freed WASM rigid bodies without panicking', async () => {
+    const req = createRequire(import.meta.url);
+    const r3RapierPkg = req.resolve('@react-three/rapier/package.json');
+    const rapierPath = createRequire(r3RapierPkg).resolve('@dimforge/rapier3d-compat');
+    const rapierNs = (await import(pathToFileURL(rapierPath).href)) as {
+      default: {
+        init: (opts?: Record<string, never>) => Promise<void>;
+        World: new (gravity: { x: number; y: number; z: number }) => RapierWorldLike & {
+          createRigidBody: (desc: unknown) => RapierRigidBodyLike;
+          removeRigidBody: (body: RapierRigidBodyLike) => void;
+          step: () => void;
+          free: () => void;
+        };
+        RigidBodyDesc: {
+          dynamic: () => unknown;
+          kinematicPositionBased: () => unknown;
+        };
+      };
+    };
+    const RAPIER = rapierNs.default;
+    await RAPIER.init({});
+
+    const world1 = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+    const cage1 = world1.createRigidBody(RAPIER.RigidBodyDesc.kinematicPositionBased());
+    const ball1 = world1.createRigidBody(RAPIER.RigidBodyDesc.dynamic());
+
+    expect(isRigidBodyLive(world1, cage1)).toBe(true);
+    expect(isRigidBodyLive(world1, ball1)).toBe(true);
+
+    // Simulate unmounting ball1 when ballCount decreases (e.g., high -> medium)
+    world1.removeRigidBody(ball1);
+    expect(isRigidBodyLive(world1, ball1)).toBe(false);
+    expect(isRigidBodyLive(world1, cage1)).toBe(true);
+
+    // Calling step + translation on remaining live bodies must not panic
+    world1.step();
+    expect(() => cage1.translation()).not.toThrow();
+
+    // Simulate StrictMode / remount creating a brand new world where handle 0 is re-allocated
+    const world2 = new RAPIER.World({ x: 0, y: -9.81, z: 0 });
+    const ball2 = world2.createRigidBody(RAPIER.RigidBodyDesc.dynamic());
+    expect(ball2.handle).toBe(cage1.handle);
+    expect(isRigidBodyLive(world2, cage1)).toBe(false);
+    expect(isRigidBodyLive(world2, ball2)).toBe(true);
+
+    // Free world1 and confirm checking stale handles never crashes WASM or poisons RefCells
+    world1.free();
+    expect(isRigidBodyLive(world1, cage1)).toBe(false);
+    expect(isRigidBodyLive(world2, cage1)).toBe(false);
+    expect(() => {
+      world2.step();
+      ball2.translation();
+    }).not.toThrow();
+
+    world2.free();
+  });
+
+  it('buildBallSpawnPositions produces collision-free coordinates strictly inside the hollow cage', () => {
+    for (const count of [40, 50] as const) {
+      const positions = buildBallSpawnPositions(count);
+      expect(positions).toHaveLength(count);
+
+      const maxBallRadius = 0.198;
+      for (const [x, y, z] of positions) {
+        const dx = x - CAGE_CENTER[0];
+        const dy = y - CAGE_CENTER[1];
+        const dz = z - CAGE_CENTER[2];
+        const distFromCenter = Math.hypot(dx, dy, dz);
+        expect(distFromCenter + maxBallRadius).toBeLessThan(CAGE_RADIUS);
+        expect(isPointOutsideBoundary({ x, y, z }, CAGE_CENTER, CAGE_BOUNDARY_RADIUS)).toBe(false);
+      }
+
+      for (let i = 0; i < positions.length; i++) {
+        for (let j = i + 1; j < positions.length; j++) {
+          const d = Math.hypot(
+            positions[i][0] - positions[j][0],
+            positions[i][1] - positions[j][1],
+            positions[i][2] - positions[j][2]
+          );
+          expect(d).toBeGreaterThan(2 * maxBallRadius);
+        }
+      }
+    }
+
+    expect(
+      isPointOutsideBoundary(
+        { x: CAGE_CENTER[0] + 1.8, y: CAGE_CENTER[1], z: CAGE_CENTER[2] },
+        CAGE_CENTER,
+        CAGE_BOUNDARY_RADIUS
+      )
+    ).toBe(true);
   });
 });

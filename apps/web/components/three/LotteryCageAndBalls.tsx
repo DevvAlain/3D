@@ -5,8 +5,10 @@ import * as THREE from 'three';
 import { useFrame } from '@react-three/fiber';
 import { MeshTransmissionMaterial } from '@react-three/drei';
 import {
+  BallCollider,
   CuboidCollider,
   RigidBody,
+  useBeforePhysicsStep,
   type RapierRigidBody,
 } from '@react-three/rapier';
 import type { DisplayQualityPreset } from '@/hooks/useDisplayController';
@@ -14,15 +16,20 @@ import {
   createBallDigitTexture,
   disposeTextureList,
 } from '@/components/three/textures';
+import {
+  buildBallSpawnPositions,
+  CAGE_BOUNDARY_RADIUS,
+  CAGE_CENTER,
+  CAGE_RADIUS,
+  isPointOutsideBoundary,
+  isRigidBodyLive,
+  WALL_THICKNESS,
+} from '@/components/three/rapier-guards';
 
 interface LotteryCageAndBallsProps {
   quality: DisplayQualityPreset;
   isSpinBoost: boolean;
 }
-
-const CAGE_CENTER: [number, number, number] = [0, 1.18, 0];
-const CAGE_RADIUS = 1.48;
-const WALL_THICKNESS = 0.36;
 
 // Build 26 evenly spaced unit normals (6 faces + 12 edges + 8 corners of a cube)
 // so inward tangent cuboids create a smooth leak-proof rotating hollow sphere.
@@ -61,39 +68,69 @@ const CAGE_WALL_NORMALS: Array<{
   });
 })();
 
-/**
- * Generates up to 57 collision-free 3D grid lattice coordinates strictly inside r <= 1.08.
- */
-function buildBallSpawnPositions(count: number): Array<[number, number, number]> {
-  const step = 0.45;
-  const candidates: Array<[number, number, number]> = [];
-  for (let ix = -2; ix <= 2; ix++) {
-    for (let iy = -2; iy <= 2; iy++) {
-      for (let iz = -2; iz <= 2; iz++) {
-        const x = ix * step;
-        const y = iy * step;
-        const z = iz * step;
-        if (x * x + y * y + z * z <= 1.08 * 1.08) {
-          candidates.push([
-            CAGE_CENTER[0] + x,
-            CAGE_CENTER[1] + y,
-            CAGE_CENTER[2] + z,
-          ]);
-        }
-      }
-    }
-  }
-  // Spread digits around center evenly via stride sampling
-  return candidates.slice(0, count);
+interface LotteryBallBodyProps {
+  id: number;
+  position: [number, number, number];
+  radius: number;
+  texture: THREE.CanvasTexture;
+  registerBody: (id: number, body: RapierRigidBody | null) => void;
 }
+
+const LotteryBallBody = React.memo(function LotteryBallBody({
+  id,
+  position,
+  radius,
+  texture,
+  registerBody,
+}: LotteryBallBodyProps) {
+  const handleRef = React.useCallback(
+    (body: RapierRigidBody | null) => {
+      registerBody(id, body);
+    },
+    [id, registerBody]
+  );
+
+  // @react-three/rapier does not invoke props.ref(null) on unmount/StrictMode cleanup,
+  // so unregister explicitly here before any subsequent physics step touches the body.
+  React.useEffect(() => {
+    return () => {
+      registerBody(id, null);
+    };
+  }, [id, registerBody]);
+
+  return (
+    <RigidBody
+      ref={handleRef}
+      position={position}
+      colliders={false}
+      restitution={0.48}
+      friction={0.28}
+      linearDamping={0.15}
+      angularDamping={0.22}
+      ccd
+    >
+      <BallCollider key={`col-${radius}`} args={[radius]} />
+      <mesh castShadow receiveShadow>
+        <sphereGeometry args={[radius, 24, 18]} />
+        <meshPhysicalMaterial
+          map={texture}
+          roughness={0.18}
+          metalness={0.12}
+          clearcoat={0.85}
+          clearcoatRoughness={0.12}
+        />
+      </mesh>
+    </RigidBody>
+  );
+});
 
 export function LotteryCageAndBalls({
   quality,
   isSpinBoost,
 }: LotteryCageAndBallsProps) {
-  const cageBodyRef = React.useRef<RapierRigidBody>(null);
+  const cageBodyRef = React.useRef<RapierRigidBody | null>(null);
   const visualCageRef = React.useRef<THREE.Group>(null);
-  const ballBodyRefs = React.useRef<Array<RapierRigidBody | null>>([]);
+  const ballBodiesRef = React.useRef<Map<number, RapierRigidBody>>(new Map());
   const spinAngleRef = React.useRef<number>(0);
   const currentSpeedRef = React.useRef<number>(0.72);
   const tempQuatRef = React.useRef(new THREE.Quaternion());
@@ -112,6 +149,15 @@ export function LotteryCageAndBalls({
       disposeTextureList(digitTextures);
     };
   }, [digitTextures]);
+
+  // Clear all Rapier handle caches cleanly on unmount / StrictMode double-invoke
+  React.useEffect(() => {
+    const bodies = ballBodiesRef.current;
+    return () => {
+      cageBodyRef.current = null;
+      bodies.clear();
+    };
+  }, []);
 
   // Curved brass exit chute sweeping from cage bottom to reveal tray
   const chuteGeometry = React.useMemo(() => {
@@ -139,6 +185,18 @@ export function LotteryCageAndBalls({
     }));
   }, [ballCount]);
 
+  const registerBallBody = React.useCallback(
+    (id: number, body: RapierRigidBody | null) => {
+      if (body) {
+        ballBodiesRef.current.set(id, body);
+      } else {
+        ballBodiesRef.current.delete(id);
+      }
+    },
+    []
+  );
+
+  // Pure Three.js animation tick — never invoke Rapier WASM FFI calls inside useFrame
   useFrame((_, delta) => {
     const dt = Math.min(delta, 0.05);
     const targetSpeed = isSpinBoost ? 1.85 : 0.72;
@@ -151,27 +209,35 @@ export function LotteryCageAndBalls({
 
     tempQuatRef.current.setFromAxisAngle(spinAxisRef.current, spinAngleRef.current);
 
-    if (cageBodyRef.current) {
-      cageBodyRef.current.setNextKinematicRotation({
-        x: tempQuatRef.current.x,
-        y: tempQuatRef.current.y,
-        z: tempQuatRef.current.z,
-        w: tempQuatRef.current.w,
-      });
-    }
     if (visualCageRef.current) {
       visualCageRef.current.quaternion.copy(tempQuatRef.current);
     }
+  });
+
+  // Synchronized Rapier step hook: validates every body against active world before WASM calls
+  useBeforePhysicsStep((world) => {
+    const cageBody = cageBodyRef.current;
+    if (isRigidBodyLive(world, cageBody)) {
+      const q = tempQuatRef.current;
+      cageBody!.setNextKinematicRotation({
+        x: q.x,
+        y: q.y,
+        z: q.z,
+        w: q.w,
+      });
+    } else if (cageBody) {
+      cageBodyRef.current = null;
+    }
 
     // Fail-safe boundary check: guarantee zero balls ever escape the sphere
-    for (let i = 0; i < ballBodyRefs.current.length; i++) {
-      const body = ballBodyRefs.current[i];
-      if (!body) continue;
+    for (const [id, body] of ballBodiesRef.current) {
+      if (!isRigidBodyLive(world, body)) {
+        ballBodiesRef.current.delete(id);
+        continue;
+      }
+
       const t = body.translation();
-      const dx = t.x - CAGE_CENTER[0];
-      const dy = t.y - CAGE_CENTER[1];
-      const dz = t.z - CAGE_CENTER[2];
-      if (dx * dx + dy * dy + dz * dz > 1.72 * 1.72) {
+      if (isPointOutsideBoundary(t, CAGE_CENTER, CAGE_BOUNDARY_RADIUS)) {
         body.setTranslation(
           { x: CAGE_CENTER[0], y: CAGE_CENTER[1] + 0.15, z: CAGE_CENTER[2] },
           true
@@ -347,31 +413,15 @@ export function LotteryCageAndBalls({
       </group>
 
       {/* 40-50 Dynamic Glossy Numbered Balls (0-9 via CanvasTexture) */}
-      {ballConfigs.map((ball, idx) => (
-        <RigidBody
+      {ballConfigs.map((ball) => (
+        <LotteryBallBody
           key={ball.id}
-          ref={(el) => {
-            ballBodyRefs.current[idx] = el;
-          }}
+          id={ball.id}
           position={ball.pos}
-          colliders="ball"
-          restitution={0.48}
-          friction={0.28}
-          linearDamping={0.15}
-          angularDamping={0.22}
-          ccd
-        >
-          <mesh castShadow receiveShadow>
-            <sphereGeometry args={[ballRadius, 24, 18]} />
-            <meshPhysicalMaterial
-              map={digitTextures[ball.digit]}
-              roughness={0.18}
-              metalness={0.12}
-              clearcoat={0.85}
-              clearcoatRoughness={0.12}
-            />
-          </mesh>
-        </RigidBody>
+          radius={ballRadius}
+          texture={digitTextures[ball.digit]}
+          registerBody={registerBallBody}
+        />
       ))}
     </group>
   );
