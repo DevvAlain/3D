@@ -5,6 +5,8 @@ import {
   PrizeSchema,
   PrizeCreateSchema,
   DrawNextRequestSchema,
+  UndoAbsentRequestSchema,
+  ResetEventRequestSchema,
   UserRoleSchema,
   isAdminRole,
   isPresenterRole,
@@ -133,5 +135,27 @@ describe('Draw Request Schemas & User Roles', () => {
     expect(isAdminRole('presenter')).toBe(false);
     expect(isPresenterRole('presenter')).toBe(true);
     expect(isPresenterRole('admin')).toBe(false);
+  });
+
+  it('validates undo-absent and reset-event confirm payloads', () => {
+    expect(
+      UndoAbsentRequestSchema.safeParse({
+        event_id: 'a0000000-0000-0000-0000-000000000001',
+      }).success
+    ).toBe(true);
+
+    expect(
+      ResetEventRequestSchema.safeParse({
+        event_id: 'a0000000-0000-0000-0000-000000000001',
+        confirm_title: '',
+      }).success
+    ).toBe(false);
+
+    expect(
+      ResetEventRequestSchema.safeParse({
+        event_id: 'a0000000-0000-0000-0000-000000000001',
+        confirm_title: 'Đại Hội Giáo Xứ 2026',
+      }).success
+    ).toBe(true);
   });
 });

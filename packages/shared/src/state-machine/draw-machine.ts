@@ -6,6 +6,7 @@ export type DrawAction =
   | { type: 'START_DRAW' }
   | { type: 'CONFIRM_WON' }
   | { type: 'MARK_ABSENT' }
+  | { type: 'UNDO_ABSENT' }
   | { type: 'VOID' }
   | { type: 'VOID_LAST' }
   | { type: 'RESET_TO_IDLE' };
@@ -14,7 +15,7 @@ export const VALID_TRANSITIONS: Record<DisplayState, ReadonlyArray<DisplayState>
   idle: ['revealing'],
   revealing: ['won', 'absent', 'void'],
   won: ['void', 'idle'],
-  absent: ['idle'],
+  absent: ['idle', 'revealing'],
   void: ['idle'],
 } as const;
 
@@ -41,6 +42,10 @@ export function transitionDraw(current: DisplayState, action: DrawAction): Displ
     case 'MARK_ABSENT':
       if (current === 'revealing') return 'absent';
       throw new Error(`INVALID_TRANSITION: Cannot MARK_ABSENT from state "${current}". Expected "revealing".`);
+
+    case 'UNDO_ABSENT':
+      if (current === 'absent') return 'revealing';
+      throw new Error(`INVALID_TRANSITION: Cannot UNDO_ABSENT from state "${current}". Expected "absent".`);
 
     case 'VOID':
       if (current === 'revealing') return 'void';

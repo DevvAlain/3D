@@ -10,7 +10,7 @@ RETURNS BIGINT
 LANGUAGE plpgsql
 VOLATILE
 SECURITY DEFINER
-SET search_path = public, extensions
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
     v_limit BIGINT;
@@ -55,7 +55,7 @@ CREATE OR REPLACE FUNCTION public.draw_next(
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, extensions
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
     v_event public.events%ROWTYPE;
@@ -227,7 +227,7 @@ CREATE OR REPLACE FUNCTION public.confirm_won(p_draw_id UUID)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, extensions
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
     v_event_id UUID;
@@ -279,7 +279,7 @@ CREATE OR REPLACE FUNCTION public.mark_absent(p_draw_id UUID)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, extensions
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
     v_event_id UUID;
@@ -323,16 +323,90 @@ $$;
 REVOKE ALL ON FUNCTION public.mark_absent(UUID) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.mark_absent(UUID) TO service_role;
 
--- 5. RPC: void_last
+-- 5. RPC: undo_absent
+-- Derives is_test from events.test_mode.
+-- Applies ONLY to the LATEST draw, ONLY if its status is 'absent' and no 'revealing' draw exists.
+-- Sets status back to 'revealing' so the presenter can confirm 'won' or mark 'absent'/'void'.
+-- Always acquires lock on parent event row FIRST to prevent deadlocks and serialize with draw_next.
+CREATE OR REPLACE FUNCTION public.undo_absent(p_event_id UUID)
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, extensions, pg_temp
+AS $$
+DECLARE
+    v_event public.events%ROWTYPE;
+    v_draw public.draws%ROWTYPE;
+    v_prize public.prizes%ROWTYPE;
+BEGIN
+    -- 1. Lock parent event row FIRST
+    SELECT * INTO v_event
+    FROM public.events
+    WHERE id = p_event_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'EVENT_NOT_FOUND: Sự kiện không tồn tại (id: %)', p_event_id;
+    END IF;
+
+    -- 2. Reject if any draw is currently in 'revealing' state for this mode
+    IF EXISTS (
+        SELECT 1 FROM public.draws
+        WHERE event_id = p_event_id
+          AND is_test = v_event.test_mode
+          AND status = 'revealing'
+    ) THEN
+        RAISE EXCEPTION 'DRAW_IN_PROGRESS: Đang có lượt quay chưa hoàn tất xác nhận (trạng thái revealing)';
+    END IF;
+
+    -- 3. Find and lock the LATEST draw for this event & mode
+    SELECT * INTO v_draw
+    FROM public.draws
+    WHERE event_id = p_event_id
+      AND is_test = v_event.test_mode
+    ORDER BY seq DESC
+    LIMIT 1
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'NO_DRAWS_TO_UNDO: Chưa có lượt quay nào trong sự kiện để hoàn tác';
+    END IF;
+
+    IF v_draw.status <> 'absent' THEN
+        RAISE EXCEPTION 'INVALID_STATE_TRANSITION: Chỉ có thể hoàn tác vắng mặt khi lượt quay mới nhất đang ở trạng thái absent (hiện tại: %)', v_draw.status;
+    END IF;
+
+    -- 4. Restore draw status back to 'revealing'
+    UPDATE public.draws
+    SET status = 'revealing', updated_at = now()
+    WHERE id = v_draw.id
+    RETURNING * INTO v_draw;
+
+    SELECT * INTO v_prize
+    FROM public.prizes
+    WHERE id = v_draw.prize_id;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'draw', row_to_json(v_draw),
+        'prize', row_to_json(v_prize)
+    );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.undo_absent(UUID) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.undo_absent(UUID) TO service_role;
+
+-- 6. RPC: void_last
 -- Derives is_test from events.test_mode.
 -- Voids ONLY the latest draw for this event & mode. Allowed only from 'revealing' or 'won'.
--- Locks parent event row FIRST to serialize with draw_next / mark_absent / confirm_won.
+-- Locks parent event row FIRST to serialize with draw_next / mark_absent / confirm_won / undo_absent.
 -- Ticket is returned to the pool because status becomes 'void'.
 CREATE OR REPLACE FUNCTION public.void_last(p_event_id UUID)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, extensions
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
     v_event public.events%ROWTYPE;
@@ -377,19 +451,23 @@ $$;
 REVOKE ALL ON FUNCTION public.void_last(UUID) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.void_last(UUID) TO service_role;
 
--- 6. RPC: clear_test_draws
+-- 7. RPC: clear_test_draws
 -- Resets only test mode draws for an event
 CREATE OR REPLACE FUNCTION public.clear_test_draws(p_event_id UUID)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, extensions
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
     v_deleted_count INT;
 BEGIN
     -- Lock parent event row
     PERFORM 1 FROM public.events WHERE id = p_event_id FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'EVENT_NOT_FOUND: Sự kiện không tồn tại (id: %)', p_event_id;
+    END IF;
 
     DELETE FROM public.draws
     WHERE event_id = p_event_id
@@ -404,32 +482,75 @@ $$;
 REVOKE ALL ON FUNCTION public.clear_test_draws(UUID) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.clear_test_draws(UUID) TO service_role;
 
--- 7. RPC: reset_event
+-- 8. RPC: reset_event
 -- Deliberate reset of all draw history for an event (protected by service_role only)
-CREATE OR REPLACE FUNCTION public.reset_event(p_event_id UUID)
+-- Writes an immutable audit_log entry capturing actor metadata and deleted draw counts.
+CREATE OR REPLACE FUNCTION public.reset_event(
+    p_event_id UUID,
+    p_actor_id UUID DEFAULT NULL,
+    p_actor_email TEXT DEFAULT NULL
+)
 RETURNS JSONB
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public, extensions
+SET search_path = public, extensions, pg_temp
 AS $$
 DECLARE
+    v_event public.events%ROWTYPE;
     v_deleted_count INT;
+    v_deleted_real INT;
+    v_deleted_test INT;
+    v_audit_id UUID;
 BEGIN
     -- Lock parent event row
-    PERFORM 1 FROM public.events WHERE id = p_event_id FOR UPDATE;
+    SELECT * INTO v_event
+    FROM public.events
+    WHERE id = p_event_id
+    FOR UPDATE;
 
     IF NOT FOUND THEN
         RAISE EXCEPTION 'EVENT_NOT_FOUND: Sự kiện không tồn tại (id: %)', p_event_id;
     END IF;
+
+    SELECT
+        COUNT(*) FILTER (WHERE is_test = false),
+        COUNT(*) FILTER (WHERE is_test = true)
+    INTO v_deleted_real, v_deleted_test
+    FROM public.draws
+    WHERE event_id = p_event_id;
 
     DELETE FROM public.draws
     WHERE event_id = p_event_id;
 
     GET DIAGNOSTICS v_deleted_count = ROW_COUNT;
 
-    RETURN jsonb_build_object('success', true, 'deleted_draws', v_deleted_count);
+    INSERT INTO public.audit_logs (
+        event_id,
+        actor_id,
+        actor_email,
+        action,
+        details
+    ) VALUES (
+        p_event_id,
+        p_actor_id,
+        p_actor_email,
+        'RESET_EVENT',
+        jsonb_build_object(
+            'event_title', v_event.title,
+            'deleted_draws', v_deleted_count,
+            'deleted_real_draws', COALESCE(v_deleted_real, 0),
+            'deleted_test_draws', COALESCE(v_deleted_test, 0)
+        )
+    )
+    RETURNING id INTO v_audit_id;
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'deleted_draws', v_deleted_count,
+        'audit_log_id', v_audit_id
+    );
 END;
 $$;
 
-REVOKE ALL ON FUNCTION public.reset_event(UUID) FROM PUBLIC, anon, authenticated;
-GRANT EXECUTE ON FUNCTION public.reset_event(UUID) TO service_role;
+REVOKE ALL ON FUNCTION public.reset_event(UUID, UUID, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.reset_event(UUID, UUID, TEXT) TO service_role;

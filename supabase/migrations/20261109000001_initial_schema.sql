@@ -76,7 +76,7 @@ CREATE INDEX IF NOT EXISTS idx_prizes_event_sort ON public.prizes (event_id, sor
 
 -- 4. DRAWS TABLE
 -- FKs use ON DELETE RESTRICT to prevent accidental loss of draw audit history.
--- Deliberate resets must go through reset_event(event_id) via service_role.
+-- Deliberate resets must go through reset_event(event_id, actor_id, actor_email) via service_role.
 CREATE TABLE IF NOT EXISTS public.draws (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     event_id UUID NOT NULL REFERENCES public.events(id) ON DELETE RESTRICT,
@@ -113,12 +113,28 @@ CREATE INDEX IF NOT EXISTS idx_draws_event_seq
 CREATE INDEX IF NOT EXISTS idx_draws_prize_status
     ON public.draws (prize_id, is_test, status);
 
--- 5. TRIGGER: Prevent modifying events.test_mode when real (non-test) draws exist
+-- 5. AUDIT LOGS TABLE (Tracks high-impact administrative operations like reset_event)
+CREATE TABLE IF NOT EXISTS public.audit_logs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID REFERENCES public.events(id) ON DELETE SET NULL,
+    actor_id UUID,
+    actor_email TEXT,
+    action TEXT NOT NULL,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_event_created
+    ON public.audit_logs (event_id, created_at DESC);
+
+-- 6. PROTECTION TRIGGERS (Once real draws exist or non-void prize draws exist)
+
+-- 6a. Prevent modifying events.test_mode when real (non-test) draws exist
 CREATE OR REPLACE FUNCTION public.check_event_test_mode_update()
 RETURNS TRIGGER
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = public, pg_temp
 AS $$
 BEGIN
     IF OLD.test_mode IS DISTINCT FROM NEW.test_mode THEN
@@ -142,11 +158,134 @@ CREATE TRIGGER trg_events_prevent_test_mode_change
     FOR EACH ROW
     EXECUTE FUNCTION public.check_event_test_mode_update();
 
--- 6. ROW LEVEL SECURITY (RLS)
+-- 6b. Prevent modifying events.digits, range_from, range_to when real (non-test) draws exist
+CREATE OR REPLACE FUNCTION public.check_event_locked_fields_update()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    IF (
+        OLD.digits IS DISTINCT FROM NEW.digits
+        OR OLD.range_from IS DISTINCT FROM NEW.range_from
+        OR OLD.range_to IS DISTINCT FROM NEW.range_to
+    ) THEN
+        IF EXISTS (
+            SELECT 1 FROM public.draws
+            WHERE event_id = NEW.id AND is_test = false
+        ) THEN
+            RAISE EXCEPTION 'EVENT_CONFIG_LOCKED: Không thể thay đổi số chữ số hoặc dải số vé khi sự kiện đã có lượt quay chính thức (is_test = false)';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.check_event_locked_fields_update() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.check_event_locked_fields_update() TO service_role;
+
+DROP TRIGGER IF EXISTS trg_events_prevent_config_change ON public.events;
+CREATE TRIGGER trg_events_prevent_config_change
+    BEFORE UPDATE OF digits, range_from, range_to ON public.events
+    FOR EACH ROW
+    EXECUTE FUNCTION public.check_event_locked_fields_update();
+
+-- 6c. Prevent deleting (or changing ticket/event_id on) excluded_tickets once real draws exist
+CREATE OR REPLACE FUNCTION public.check_excluded_tickets_locked()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF EXISTS (
+            SELECT 1 FROM public.draws
+            WHERE event_id = OLD.event_id AND is_test = false
+        ) THEN
+            RAISE EXCEPTION 'EXCLUDED_TICKET_LOCKED: Không thể xóa vé loại trừ khi sự kiện đã có lượt quay chính thức (is_test = false)';
+        END IF;
+        RETURN OLD;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF (OLD.ticket IS DISTINCT FROM NEW.ticket OR OLD.event_id IS DISTINCT FROM NEW.event_id) THEN
+            IF EXISTS (
+                SELECT 1 FROM public.draws
+                WHERE event_id = OLD.event_id AND is_test = false
+            ) THEN
+                RAISE EXCEPTION 'EXCLUDED_TICKET_LOCKED: Không thể sửa vé loại trừ khi sự kiện đã có lượt quay chính thức (is_test = false)';
+            END IF;
+        END IF;
+        RETURN NEW;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.check_excluded_tickets_locked() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.check_excluded_tickets_locked() TO service_role;
+
+DROP TRIGGER IF EXISTS trg_excluded_tickets_prevent_delete ON public.excluded_tickets;
+CREATE TRIGGER trg_excluded_tickets_prevent_delete
+    BEFORE DELETE OR UPDATE OF ticket, event_id ON public.excluded_tickets
+    FOR EACH ROW
+    EXECUTE FUNCTION public.check_excluded_tickets_locked();
+
+-- 6d. Prevent lowering prizes.quantity below the number of non-void draws for that prize
+CREATE OR REPLACE FUNCTION public.check_prize_quantity_update()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_test_mode BOOLEAN;
+    v_real_non_void INT;
+    v_mode_non_void INT;
+    v_min_allowed INT;
+BEGIN
+    IF NEW.quantity < OLD.quantity THEN
+        SELECT test_mode INTO v_test_mode
+        FROM public.events
+        WHERE id = NEW.event_id;
+
+        SELECT COUNT(*) INTO v_real_non_void
+        FROM public.draws
+        WHERE prize_id = NEW.id
+          AND is_test = false
+          AND status <> 'void';
+
+        SELECT COUNT(*) INTO v_mode_non_void
+        FROM public.draws
+        WHERE prize_id = NEW.id
+          AND is_test = COALESCE(v_test_mode, false)
+          AND status <> 'void';
+
+        v_min_allowed := GREATEST(v_real_non_void, v_mode_non_void);
+
+        IF NEW.quantity < v_min_allowed THEN
+            RAISE EXCEPTION 'PRIZE_QUANTITY_BELOW_DRAWS: Không thể giảm số lượng giải thưởng (%) xuống thấp hơn số lượt đã quay không hủy (%)', NEW.quantity, v_min_allowed;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.check_prize_quantity_update() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.check_prize_quantity_update() TO service_role;
+
+DROP TRIGGER IF EXISTS trg_prizes_prevent_quantity_underflow ON public.prizes;
+CREATE TRIGGER trg_prizes_prevent_quantity_underflow
+    BEFORE UPDATE OF quantity ON public.prizes
+    FOR EACH ROW
+    EXECUTE FUNCTION public.check_prize_quantity_update();
+
+-- 7. ROW LEVEL SECURITY (RLS)
 ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.excluded_tickets ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.prizes ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.draws ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.audit_logs ENABLE ROW LEVEL SECURITY;
 
 -- Helper to verify if authenticated user has 'admin' in app_metadata
 CREATE OR REPLACE FUNCTION public.is_admin()
@@ -154,7 +293,7 @@ RETURNS BOOLEAN
 LANGUAGE sql
 STABLE
 SECURITY DEFINER
-SET search_path = public, auth
+SET search_path = public, auth, pg_temp
 AS $$
   SELECT COALESCE(
     (auth.jwt() -> 'app_metadata' ->> 'role') = 'admin',
@@ -193,15 +332,21 @@ CREATE POLICY admin_select_draws ON public.draws
     TO authenticated
     USING (public.is_admin());
 
--- Table-level defense in depth:
--- Revoke all access from PUBLIC and anon; restrict authenticated on draws to SELECT only.
-REVOKE ALL ON public.events, public.excluded_tickets, public.prizes, public.draws FROM PUBLIC, anon;
-REVOKE ALL ON public.draws FROM authenticated;
-GRANT SELECT ON public.draws TO authenticated;
-GRANT SELECT, INSERT, UPDATE, DELETE ON public.events, public.excluded_tickets, public.prizes TO authenticated;
-GRANT ALL ON public.events, public.excluded_tickets, public.prizes, public.draws TO service_role;
+-- Audit Logs RLS: Admin has SELECT-only access; inserts happen only via service_role RPCs/server.
+CREATE POLICY admin_select_audit_logs ON public.audit_logs
+    FOR SELECT
+    TO authenticated
+    USING (public.is_admin());
 
--- 7. REALTIME PUBLICATION
+-- Table-level defense in depth:
+-- Revoke all access from PUBLIC and anon; restrict authenticated on draws and audit_logs to SELECT only.
+REVOKE ALL ON public.events, public.excluded_tickets, public.prizes, public.draws, public.audit_logs FROM PUBLIC, anon;
+REVOKE ALL ON public.draws, public.audit_logs FROM authenticated;
+GRANT SELECT ON public.draws, public.audit_logs TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.events, public.excluded_tickets, public.prizes TO authenticated;
+GRANT ALL ON public.events, public.excluded_tickets, public.prizes, public.draws, public.audit_logs TO service_role;
+
+-- 8. REALTIME PUBLICATION
 DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname = 'supabase_realtime') THEN
@@ -216,7 +361,7 @@ BEGIN
     END IF;
 END $$;
 
--- 8. STORAGE BUCKET: event-assets
+-- 9. STORAGE BUCKET: event-assets
 -- Public read, admin-only write, SVG disallowed for XSS safety
 DO $$
 BEGIN

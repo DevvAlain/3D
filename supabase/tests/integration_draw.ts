@@ -13,9 +13,27 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import net from 'node:net';
 import { Pool, PoolClient } from 'pg';
 import EmbeddedPostgres from 'embedded-postgres';
 import { createClient } from '@supabase/supabase-js';
+
+async function getFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      if (addr && typeof addr === 'object') {
+        const port = addr.port;
+        srv.close(() => resolve(port));
+      } else {
+        srv.close(() => reject(new Error('Failed to get free port')));
+      }
+    });
+  });
+}
 
 // Helper to verify whether local Supabase stack is reachable
 async function isLocalSupabaseRunning(): Promise<boolean> {
@@ -59,23 +77,24 @@ async function runIntegrationTests() {
       });
     } else {
       console.log('\n[ENV] Local Supabase Docker stack not detected. Bootstrapping native Embedded PostgreSQL...');
+      const pgPort = await getFreePort();
       tempDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'church-pg-test-'));
       embeddedPg = new EmbeddedPostgres({
         databaseDir: tempDataDir,
         user: 'postgres',
         password: 'postgres_test_password',
-        port: 54333,
+        port: pgPort,
         persistent: false,
         initdbFlags: ['-E', 'UTF8', '--no-locale'],
         onLog: () => {},
       });
       await embeddedPg.initialise();
       await embeddedPg.start();
-      console.log('✓ Native PostgreSQL server started on 127.0.0.1:54333 (UTF8).');
+      console.log(`✓ Native PostgreSQL server started on 127.0.0.1:${pgPort} (UTF8).`);
 
       pool = new Pool({
         host: '127.0.0.1',
-        port: 54333,
+        port: pgPort,
         user: 'postgres',
         password: 'postgres_test_password',
         database: 'postgres',
@@ -336,6 +355,7 @@ async function runIntegrationTests() {
       { label: 'draw_next', sql: `SELECT public.draw_next('${activeEventId}'::uuid, 'x')` },
       { label: 'confirm_won', sql: `SELECT public.confirm_won('${contestedDrawId}'::uuid)` },
       { label: 'mark_absent', sql: `SELECT public.mark_absent('${contestedDrawId}'::uuid)` },
+      { label: 'undo_absent', sql: `SELECT public.undo_absent('${activeEventId}'::uuid)` },
       { label: 'void_last', sql: `SELECT public.void_last('${activeEventId}'::uuid)` },
       { label: 'clear_test_draws', sql: `SELECT public.clear_test_draws('${activeEventId}'::uuid)` },
       { label: 'reset_event', sql: `SELECT public.reset_event('${activeEventId}'::uuid)` },
@@ -407,6 +427,23 @@ async function runIntegrationTests() {
       presenterClient.release();
     }
 
+    // Verify search_path contains pg_temp on EVERY SECURITY DEFINER function in public schema
+    const secDefRes = await pool.query<{ proname: string; proconfig: string[] | null }>(`
+      SELECT p.proname, p.proconfig
+      FROM pg_proc p
+      JOIN pg_namespace n ON n.oid = p.pronamespace
+      WHERE n.nspname = 'public'
+        AND p.prosecdef = true
+      ORDER BY p.proname
+    `);
+    for (const fn of secDefRes.rows) {
+      const searchPathCfg = (fn.proconfig ?? []).find((c) => c.startsWith('search_path='));
+      if (!searchPathCfg || !searchPathCfg.includes('pg_temp')) {
+        throw new Error(`SECURITY FAILURE: SECURITY DEFINER function public.${fn.proname} missing pg_temp in search_path (${JSON.stringify(fn.proconfig)})`);
+      }
+    }
+    console.log(`  ✓ All ${secDefRes.rows.length} SECURITY DEFINER functions enforce pg_temp in search_path.`);
+
     // If local Supabase PostgREST is running, test over HTTP with real PostgREST!
     if (useLocalSupabase) {
       console.log('[PostgREST] Verifying HTTP RPC & direct table rejections via @supabase/supabase-js...');
@@ -434,7 +471,14 @@ async function runIntegrationTests() {
     }
     if (!fkRestricted) throw new Error('Expected ON DELETE RESTRICT to prevent deleting event with draws');
 
-    await pool.query(`SELECT public.reset_event($1)`, [activeEventId]);
+    const actorId = '00000000-0000-0000-0000-000000000099';
+    const resetRes = (
+      await pool.query<{ r: any }>(`SELECT public.reset_event($1, $2, $3) AS r`, [
+        activeEventId,
+        actorId,
+        'admin@parish.org',
+      ])
+    ).rows[0].r;
     const countAfterReset = await pool.query<{ cnt: string }>(
       `SELECT COUNT(*) AS cnt FROM public.draws WHERE event_id = $1`,
       [activeEventId]
@@ -442,7 +486,24 @@ async function runIntegrationTests() {
     if (Number(countAfterReset.rows[0].cnt) !== 0) {
       throw new Error('reset_event failed to clear draws');
     }
-    console.log('✓ reset_event successfully cleared all draws.');
+    const auditRes = await pool.query<{ action: string; actor_email: string; details: any }>(
+      `SELECT action, actor_email, details FROM public.audit_logs WHERE id = $1`,
+      [resetRes.audit_log_id]
+    );
+    if (
+      auditRes.rows.length !== 1 ||
+      auditRes.rows[0].action !== 'RESET_EVENT' ||
+      auditRes.rows[0].actor_email !== 'admin@parish.org'
+    ) {
+      throw new Error(`Expected RESET_EVENT audit log entry, got ${JSON.stringify(auditRes.rows)}`);
+    }
+    await assertRoleDenied(
+      'authenticated',
+      `INSERT INTO public.audit_logs (action) VALUES ('FAKE')`,
+      'direct INSERT on audit_logs',
+      adminJwt
+    );
+    console.log(`✓ reset_event cleared all draws and wrote audit log (${resetRes.audit_log_id}).`);
 
     // Deactivate activeEventId before Test 5
     await pool.query(`UPDATE public.events SET is_active = false WHERE id = $1`, [activeEventId]);
@@ -674,8 +735,185 @@ async function runIntegrationTests() {
     const rngDistribution = rngRes.rows.map((r) => `${r.bucket}:${r.cnt}`).join(', ');
     console.log(`✓ 5,000 direct crypto_random_int(5) samples: { ${rngDistribution} }`);
 
+    await pool.query(`UPDATE public.events SET is_active = false WHERE id = $1`, [uniformEventId]);
+
+    // ========================================================================
+    // TEST 9: undo_absent (Rules + Parallel Race) & Real-Draw Lock Triggers
+    // ========================================================================
+    console.log('\n----------------------------------------------------------------');
+    console.log('TEST 9: undo_absent & Real-Draw Config/Prize/Excluded Lock Triggers');
+    console.log('----------------------------------------------------------------');
+
+    // 9a: undo_absent lifecycle and edge cases
+    const undoEventId = await createEvent({
+      title: 'Undo Absent & Lock Trigger Event',
+      rangeFrom: 1,
+      rangeTo: 50,
+      isActive: true,
+      testMode: true,
+    });
+    await pool.query(
+      `INSERT INTO public.prizes (event_id, name, reward, quantity, sort_order) VALUES ($1, 'Giải Ba', 'Quà tặng', 3, 1)`,
+      [undoEventId]
+    );
+
+    // Rejected when no draws exist yet
+    let undoEmptyFailed = false;
+    try {
+      await pool.query(`SELECT public.undo_absent($1)`, [undoEventId]);
+    } catch (err: any) {
+      if (err.message.includes('NO_DRAWS_TO_UNDO')) {
+        undoEmptyFailed = true;
+      }
+    }
+    if (!undoEmptyFailed) throw new Error('Expected undo_absent to reject when no draws exist');
+
+    // Draw 1 -> mark absent -> undo_absent -> revealing
+    const u1 = (await pool.query(`SELECT public.draw_next($1) AS r`, [undoEventId])).rows[0].r.draw;
+    await pool.query(`SELECT public.mark_absent($1)`, [u1.id]);
+    const undoOk = (await pool.query(`SELECT public.undo_absent($1) AS r`, [undoEventId])).rows[0].r;
+    if (!undoOk.success || undoOk.draw.id !== u1.id || undoOk.draw.status !== 'revealing' || !undoOk.prize) {
+      throw new Error(`undo_absent did not restore revealing cleanly: ${JSON.stringify(undoOk)}`);
+    }
+
+    // Rejected while a revealing draw is in progress (Draw 1 is currently revealing)
+    let undoRevealingFailed = false;
+    try {
+      await pool.query(`SELECT public.undo_absent($1)`, [undoEventId]);
+    } catch (err: any) {
+      if (err.message.includes('DRAW_IN_PROGRESS')) {
+        undoRevealingFailed = true;
+      }
+    }
+    if (!undoRevealingFailed) throw new Error('Expected undo_absent to fail while a revealing draw exists');
+
+    // Confirm u1 won -> draw 2 -> mark absent -> draw 3 -> confirm won
+    // Now u2 is absent (not latest), u3 is won (latest): undo_absent MUST reject!
+    await pool.query(`SELECT public.confirm_won($1)`, [u1.id]);
+    const u2 = (await pool.query(`SELECT public.draw_next($1) AS r`, [undoEventId])).rows[0].r.draw;
+    await pool.query(`SELECT public.mark_absent($1)`, [u2.id]);
+    const u3 = (await pool.query(`SELECT public.draw_next($1) AS r`, [undoEventId])).rows[0].r.draw;
+    await pool.query(`SELECT public.confirm_won($1)`, [u3.id]);
+
+    let undoNotLatestFailed = false;
+    try {
+      await pool.query(`SELECT public.undo_absent($1)`, [undoEventId]);
+    } catch (err: any) {
+      if (err.message.includes('INVALID_STATE_TRANSITION')) {
+        undoNotLatestFailed = true;
+      }
+    }
+    if (!undoNotLatestFailed) throw new Error('Expected undo_absent to reject when absent draw is not the latest');
+
+    // Verify Draw 4 -> mark absent, then Draw 5 is revealing: undo_absent MUST fail with DRAW_IN_PROGRESS
+    const u4 = (await pool.query(`SELECT public.draw_next($1) AS r`, [undoEventId])).rows[0].r.draw;
+    await pool.query(`SELECT public.mark_absent($1)`, [u4.id]);
+    await pool.query(`SELECT public.draw_next($1) AS r`, [undoEventId]);
+    let undoBlockedByRevealing = false;
+    try {
+      await pool.query(`SELECT public.undo_absent($1)`, [undoEventId]);
+    } catch (err: any) {
+      if (err.message.includes('DRAW_IN_PROGRESS')) {
+        undoBlockedByRevealing = true;
+      }
+    }
+    if (!undoBlockedByRevealing) throw new Error('Expected undo_absent to reject with DRAW_IN_PROGRESS when Draw 5 is revealing');
+    await pool.query(`SELECT public.void_last($1)`, [undoEventId]); // clear Draw 5
+
+    // Parallel race: latest draw u6 is 'absent', fire undo_absent vs draw_next concurrently -> EXACTLY ONE WINS
+    const u6 = (await pool.query(`SELECT public.draw_next($1) AS r`, [undoEventId])).rows[0].r.draw;
+    await pool.query(`SELECT public.mark_absent($1)`, [u6.id]);
+    const [raceUndo, raceDraw] = await Promise.allSettled([
+      pool.query(`SELECT public.undo_absent($1) AS r`, [undoEventId]),
+      pool.query(`SELECT public.draw_next($1, $2) AS r`, [undoEventId, `race_draw_${Date.now()}`]),
+    ]);
+    const raceSuccess = [raceUndo, raceDraw].filter((r) => r.status === 'fulfilled');
+    const raceFail = [raceUndo, raceDraw].filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
+    if (raceSuccess.length !== 1 || raceFail.length !== 1) {
+      throw new Error(`Parallel undo_absent vs draw_next FAILED: won=${raceSuccess.length}, fail=${raceFail.length}`);
+    }
+    console.log(`✓ undo_absent lifecycle verified & parallel race cleanly serialized (${raceFail[0].reason.message}).`);
+
+    await pool.query(`UPDATE public.events SET is_active = false WHERE id = $1`, [undoEventId]);
+
+    // 9b: Lock triggers once real draws (is_test = false) exist
+    const lockEventId = await createEvent({
+      title: 'Lock Triggers Test Event',
+      rangeFrom: 1,
+      rangeTo: 500,
+      isActive: true,
+      testMode: true,
+    });
+    const exclRow = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO public.excluded_tickets (event_id, ticket, reason) VALUES ($1, 10, 'Test'), ($1, 20, 'Locked') RETURNING id`,
+        [lockEventId]
+      )
+    ).rows[0];
+    const lockPrizeId = (
+      await pool.query<{ id: string }>(
+        `INSERT INTO public.prizes (event_id, name, reward, quantity, sort_order) VALUES ($1, 'Giải Đặc Biệt', 'SH 150i', 4, 1) RETURNING id`,
+        [lockEventId]
+      )
+    ).rows[0].id;
+
+    // In test_mode=true with only test draws, deleting excluded_tickets MUST still succeed
+    const tDraw = (await pool.query(`SELECT public.draw_next($1) AS r`, [lockEventId])).rows[0].r.draw;
+    await pool.query(`SELECT public.confirm_won($1)`, [tDraw.id]);
+    await pool.query(`DELETE FROM public.excluded_tickets WHERE id = $1`, [exclRow.id]);
+    console.log('✓ Deleting excluded_tickets allowed when only test draws exist.');
+
+    // Clear test draws, switch to live mode (test_mode = false), draw 2 real draws
+    await pool.query(`SELECT public.clear_test_draws($1)`, [lockEventId]);
+    await pool.query(`UPDATE public.events SET test_mode = false WHERE id = $1`, [lockEventId]);
+
+    const r1 = (await pool.query(`SELECT public.draw_next($1) AS r`, [lockEventId])).rows[0].r.draw;
+    await pool.query(`SELECT public.confirm_won($1)`, [r1.id]);
+    const r2 = (await pool.query(`SELECT public.draw_next($1) AS r`, [lockEventId])).rows[0].r.draw;
+    await pool.query(`SELECT public.mark_absent($1)`, [r2.id]);
+    // Non-void real draws on lockPrizeId = 2 (1 won + 1 absent)
+
+    const assertTriggerReject = async (sql: string, expectedCode: string, label: string) => {
+      let rejected = false;
+      try {
+        await pool.query(sql);
+      } catch (err: any) {
+        if (err.message.includes(expectedCode)) {
+          rejected = true;
+          console.log(`  ✓ Trigger/FK blocked (${label}): ${err.message}`);
+        } else {
+          throw new Error(`Unexpected error for ${label}: ${err.message}`);
+        }
+      }
+      if (!rejected) throw new Error(`Expected ${expectedCode} for ${label}`);
+    };
+
+    await assertTriggerReject(`UPDATE public.events SET digits = 6 WHERE id = '${lockEventId}'`, 'EVENT_CONFIG_LOCKED', 'events.digits');
+    await assertTriggerReject(`UPDATE public.events SET range_from = 2 WHERE id = '${lockEventId}'`, 'EVENT_CONFIG_LOCKED', 'events.range_from');
+    await assertTriggerReject(`UPDATE public.events SET range_to = 600 WHERE id = '${lockEventId}'`, 'EVENT_CONFIG_LOCKED', 'events.range_to');
+    await assertTriggerReject(`DELETE FROM public.excluded_tickets WHERE event_id = '${lockEventId}'`, 'EXCLUDED_TICKET_LOCKED', 'delete excluded_tickets');
+    await assertTriggerReject(`UPDATE public.prizes SET quantity = 1 WHERE id = '${lockPrizeId}'`, 'PRIZE_QUANTITY_BELOW_DRAWS', 'prizes.quantity < non-void draws (1 < 2)');
+    await assertTriggerReject(`DELETE FROM public.prizes WHERE id = '${lockPrizeId}'`, 'violates RESTRICT setting of foreign key constraint', 'delete prize with draws');
+
+    // Lowering prizes.quantity to EXACTLY non-void count (2) MUST succeed
+    await pool.query(`UPDATE public.prizes SET quantity = 2 WHERE id = $1`, [lockPrizeId]);
+    console.log('  ✓ Lowering prizes.quantity to exact non-void count (2) succeeded.');
+
+    // Verify authenticated admin CAN still update non-locked event fields even with triggers active
+    const authAdminClient = await pool.connect();
+    try {
+      await authAdminClient.query('BEGIN');
+      await authAdminClient.query('SET LOCAL ROLE authenticated');
+      await authAdminClient.query(`SELECT set_config('request.jwt.claims', $1, true)`, [JSON.stringify(adminJwt)]);
+      await authAdminClient.query(`UPDATE public.events SET title = 'Tên Mới Được Phép' WHERE id = $1`, [lockEventId]);
+      await authAdminClient.query('COMMIT');
+      console.log('  ✓ Authenticated admin updated unlocked event title with triggers active.');
+    } finally {
+      authAdminClient.release();
+    }
+
     console.log('\n========================================================================');
-    console.log('        🎉 ALL 8 MULTI-CONNECTION INTEGRATION TESTS PASSED 100% 🎉      ');
+    console.log('        🎉 ALL 9 MULTI-CONNECTION INTEGRATION TESTS PASSED 100% 🎉      ');
     console.log('========================================================================\n');
   } finally {
     try {
@@ -693,7 +931,11 @@ async function runIntegrationTests() {
   }
 }
 
-runIntegrationTests().catch((err) => {
-  console.error('\n❌ Integration Test Suite Failed:', err);
-  process.exit(1);
-});
+runIntegrationTests()
+  .then(() => {
+    process.exit(0);
+  })
+  .catch((err) => {
+    console.error('\n❌ Integration Test Suite Failed:', err);
+    process.exit(1);
+  });

@@ -34,6 +34,20 @@ describe('Draw State Machine', () => {
     expect(state).toBe('idle');
   });
 
+  it('allows undoing an accidental absent decision: absent -> revealing -> won', () => {
+    let state: DisplayState = 'idle';
+
+    state = transitionDraw(state, { type: 'START_DRAW' });
+    state = transitionDraw(state, { type: 'MARK_ABSENT' });
+    expect(state).toBe('absent');
+
+    state = transitionDraw(state, { type: 'UNDO_ABSENT' });
+    expect(state).toBe('revealing');
+
+    state = transitionDraw(state, { type: 'CONFIRM_WON' });
+    expect(state).toBe('won');
+  });
+
   it('allows voiding an in-progress draw: revealing -> void -> idle', () => {
     let state: DisplayState = 'idle';
 
@@ -57,6 +71,7 @@ describe('Draw State Machine', () => {
     expect(() => transitionDraw('idle', { type: 'CONFIRM_WON' })).toThrowError(/Cannot CONFIRM_WON from state "idle"/);
     expect(() => transitionDraw('idle', { type: 'MARK_ABSENT' })).toThrowError(/Cannot MARK_ABSENT from state "idle"/);
     expect(() => transitionDraw('won', { type: 'CONFIRM_WON' })).toThrowError(/Cannot CONFIRM_WON from state "won"/);
+    expect(() => transitionDraw('won', { type: 'UNDO_ABSENT' })).toThrowError(/Cannot UNDO_ABSENT from state "won"/);
     expect(() => transitionDraw('absent', { type: 'CONFIRM_WON' })).toThrowError(/Cannot CONFIRM_WON from state "absent"/);
     expect(() => transitionDraw('revealing', { type: 'START_DRAW' })).toThrowError(/Cannot START_DRAW from state "revealing"/);
   });
@@ -69,6 +84,7 @@ describe('Draw State Machine', () => {
     expect(canTransitionState('won', 'void')).toBe(true);
     expect(canTransitionState('won', 'idle')).toBe(true);
     expect(canTransitionState('absent', 'idle')).toBe(true);
+    expect(canTransitionState('absent', 'revealing')).toBe(true);
 
     // Invalid direct jumps
     expect(canTransitionState('idle', 'won')).toBe(false);
