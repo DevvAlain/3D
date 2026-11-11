@@ -1,4 +1,4 @@
-# 🎟️ Church Lucky Draw (Quay Số May Mắn Giáo Xứ)
+# 🎟️ Church Lucky Draw
 
 Hệ thống quay số may mắn 3D cao cấp dành cho đại hội / lễ hội giáo xứ với màn hình trình chiếu máy chiếu **"Gala of Stained Glass"** và khu vực hậu trường quản trị độc lập.
 
